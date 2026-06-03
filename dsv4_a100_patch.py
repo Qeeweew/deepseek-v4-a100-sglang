@@ -372,10 +372,10 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
     import sglang.srt.layers.attention.dsv4.indexer as dsv4_indexer
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
     from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-    from triton_kernels import bf16_paged_mqa_logits
+    from triton_kernels import bf16_indexer_q, bf16_paged_mqa_logits
 
     def bf16_paged_mqa_logits_torch(
-        q_fp8: torch.Tensor,
+        q: torch.Tensor,
         kvcache_bf16: torch.Tensor,
         weight: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -386,7 +386,7 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
     ) -> torch.Tensor:
         with _record_function("c4_bf16_paged_mqa_logits_triton"):
             return bf16_paged_mqa_logits(
-                q_fp8,
+                q,
                 kvcache_bf16,
                 weight,
                 seq_lens,
@@ -395,6 +395,46 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
                 max_seq_len,
                 clean_logits,
             )
+
+    def compute_q(
+        self,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        weight: torch.Tensor,
+    ):
+        q, _ = self.wq_b(q_lora)
+        q = q.view(-1, self.n_local_heads, self.head_dim)
+        q_out = getattr(self, "_dsv4_bf16_indexer_q_out", None)
+        weights_out = getattr(self, "_dsv4_bf16_indexer_weights_out", None)
+        scratch_q = getattr(self, "_dsv4_bf16_indexer_scratch_q", None)
+        freqs_real = getattr(self, "_dsv4_bf16_indexer_freqs_real", None)
+        expected_q_shape = q.shape
+        expected_w_shape = (*weight.shape, 1)
+        if q_out is None or q_out.shape != expected_q_shape or q_out.device != q.device:
+            q_out = torch.empty(expected_q_shape, device=q.device, dtype=torch.bfloat16)
+            self._dsv4_bf16_indexer_q_out = q_out
+        if (
+            weights_out is None
+            or weights_out.shape != expected_w_shape
+            or weights_out.device != weight.device
+        ):
+            weights_out = torch.empty(expected_w_shape, device=weight.device, dtype=torch.float32)
+            self._dsv4_bf16_indexer_weights_out = weights_out
+        if freqs_real is None or freqs_real.device != self.freqs_cis.device:
+            freqs_real = torch.view_as_real(self.freqs_cis).flatten(-2).contiguous()
+            self._dsv4_bf16_indexer_freqs_real = freqs_real
+        return bf16_indexer_q(
+            q,
+            weight,
+            self.weight_scale,
+            self.freqs_cis,
+            positions,
+            q_out=q_out,
+            weights_out=weights_out,
+            scratch_q=scratch_q,
+            allow_inplace_input=True,
+            freqs_real=freqs_real,
+        )
 
     def forward_c4_indexer(
         self,
@@ -417,7 +457,7 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
 
         if enable_multi_stream:
-            q_fp8, weights, c4_indexer_kv_cache = self._forward_prepare_multi_stream(
+            q_bf16, weights, c4_indexer_kv_cache = self._forward_prepare_multi_stream(
                 x=x,
                 q_lora=q_lora,
                 c4_indexer=c4_indexer,
@@ -429,7 +469,7 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
             )
         else:
             assert q_lora_ready is None
-            q_fp8, weights, c4_indexer_kv_cache = self._forward_prepare_normal(
+            q_bf16, weights, c4_indexer_kv_cache = self._forward_prepare_normal(
                 x=x,
                 q_lora=q_lora,
                 c4_indexer=c4_indexer,
@@ -438,8 +478,8 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
                 token_to_kv_pool=token_to_kv_pool,
             )
 
-        assert len(q_fp8.shape) == 3
-        q_fp8 = q_fp8.unsqueeze(1)
+        assert len(q_bf16.shape) == 3
+        q_bf16 = q_bf16.unsqueeze(1)
         assert len(c4_indexer_kv_cache.shape) == 2
         assert c4_indexer_kv_cache.dtype == torch.bfloat16
         with _record_function("c4_indexer_bf16_cache_view"):
@@ -456,7 +496,7 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
         if _c4sl.dim() == 1:
             _c4sl = _c4sl.unsqueeze(-1)
         logits = bf16_paged_mqa_logits_torch(
-            q_fp8,
+            q_bf16,
             c4_indexer_kv_cache,
             weights,
             _c4sl,
@@ -513,13 +553,14 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
 
     dsv4_indexer.bf16_paged_mqa_logits_torch = bf16_paged_mqa_logits_torch
     dsv4_indexer.fp8_paged_mqa_logits_torch = bf16_paged_mqa_logits_torch
+    dsv4_indexer.C4Indexer.compute_q = compute_q
     dsv4_indexer.C4IndexerBackendMixin.forward_c4_indexer = forward_c4_indexer
 
 
 def _extract_compressor_positions(plan, compress_ratio: int) -> torch.Tensor:
     from triton_kernels import compressor_positions_from_plan
 
-    return compressor_positions_from_plan(plan[1], compress_ratio)
+    return compressor_positions_from_plan(plan[1].view(torch.int32).reshape(plan[1].shape[0], 4), compress_ratio)
 
 
 def _patch_dsv4_core_compressor_bf16_store() -> None:
@@ -569,10 +610,14 @@ def _patch_dsv4_core_compressor_bf16_store() -> None:
         if plan.is_decode:
             with _record_function("compressor_decode_boundary_mask"):
                 positions = compressor_decode_mask_positions(
-                    kv_compressed, plan[1], compress_ratio
+                    kv_compressed,
+                    plan[1].view(torch.int32).reshape(plan[1].shape[0], 4),
+                    compress_ratio,
                 )
         else:
-            positions = compressor_positions_from_plan(plan[1], compress_ratio)
+            positions = compressor_positions_from_plan(
+                plan[1].view(torch.int32).reshape(plan[1].shape[0], 4), compress_ratio
+            )
         with _record_function("compressor_norm_rope_triton"):
             fused_norm_rope_inplace_triton(
                 kv_compressed,
@@ -588,7 +633,9 @@ def _patch_dsv4_core_compressor_bf16_store() -> None:
             return out_loc
         with _record_function("compressor_prefill_out_loc_select"):
             _, out_loc_to_store = compressor_prefill_metadata(
-                plan[1], out_loc, plan.compress_ratio
+                plan[1].view(torch.int32).reshape(plan[1].shape[0], 4),
+                out_loc,
+                plan.compress_ratio,
             )
             return out_loc_to_store
 
@@ -642,13 +689,17 @@ def _patch_dsv4_core_compressor_bf16_store() -> None:
             if plan.is_decode:
                 with _record_function("compressor_decode_boundary_mask"):
                     positions = compressor_decode_mask_positions(
-                        kv_compressed, plan[1], compress_ratio
+                        kv_compressed,
+                        plan[1].view(torch.int32).reshape(plan[1].shape[0], 4),
+                        compress_ratio,
                     )
                 out_loc_to_store = out_loc
             else:
                 with _record_function("compressor_prefill_metadata"):
                     positions, out_loc_to_store = compressor_prefill_metadata(
-                        plan[1], out_loc, compress_ratio
+                        plan[1].view(torch.int32).reshape(plan[1].shape[0], 4),
+                        out_loc,
+                        compress_ratio,
                     )
             with _record_function("compressor_norm_rope_triton"):
                 fused_norm_rope_inplace_triton(
@@ -694,14 +745,7 @@ def _patch_dsv4_core_compressor_bf16_store() -> None:
 
 def _trim_rows(page_indices: torch.Tensor, lengths: torch.Tensor, q_tokens: int):
     with _record_function("trim_sparse_index_rows"):
-        if page_indices.ndim == 3:
-            page_indices = page_indices.squeeze(1)
-        if page_indices.shape[0] >= q_tokens:
-            return page_indices[:q_tokens], lengths[:q_tokens].to(torch.int32)
-        pad_rows = q_tokens - page_indices.shape[0]
-        page_indices = torch.nn.functional.pad(page_indices, (0, 0, 0, pad_rows), value=-1)
-        lengths = torch.nn.functional.pad(lengths.to(torch.int32), (0, pad_rows), value=1)
-        return page_indices, lengths
+        return trim_and_pad_rows(page_indices, lengths, q_tokens)
 
 
 def _gather_bf16_kv(buffer: torch.Tensor, indices: torch.Tensor, lengths: torch.Tensor, total_topk: int):
@@ -713,10 +757,50 @@ def _gather_bf16_kv(buffer: torch.Tensor, indices: torch.Tensor, lengths: torch.
 
 def _patch_deepseek_v4_backend() -> None:
     from sglang.srt.layers.attention import deepseek_v4_backend as dsv4_backend
-    from triton_kernels import gather_bf16_kv_into
+    from triton_kernels import direct_dual_sparse_attention, direct_sparse_attention, gather_bf16_kv_into
 
     original_forward = dsv4_backend.DeepseekV4AttnBackend.forward
     run_unified_attention = _TRITON_COMMON.run_unified_attention
+
+    def _get_reusable_sparse_buffers(
+        self,
+        q_tokens: int,
+        total_topk: int,
+        head_dim: int,
+        device: torch.device,
+    ):
+        cached = getattr(self, "_dsv4_sparse_buffers", None)
+        needed = (q_tokens, total_topk, head_dim, device.index if device.type == "cuda" else -1)
+        if cached is not None and cached["shape"] == needed:
+            return cached["gathered"], cached["invalid_mask"]
+        gathered = torch.empty((q_tokens, total_topk, head_dim), dtype=torch.bfloat16, device=device)
+        invalid_mask = torch.empty((q_tokens, total_topk), dtype=torch.bool, device=device)
+        self._dsv4_sparse_buffers = {
+            "shape": needed,
+            "gathered": gathered,
+            "invalid_mask": invalid_mask,
+        }
+        return gathered, invalid_mask
+
+    def _get_reusable_attention_outputs(
+        self,
+        q_tokens: int,
+        q_heads: int,
+        head_dim: int,
+        device: torch.device,
+    ):
+        cached = getattr(self, "_dsv4_attention_outputs", None)
+        needed = (q_tokens, q_heads, head_dim, device.index if device.type == "cuda" else -1)
+        if cached is not None and cached["shape"] == needed:
+            return cached["output"], cached["lse"]
+        output = torch.empty((q_tokens, q_heads, head_dim), dtype=torch.bfloat16, device=device)
+        lse = torch.empty((q_tokens, q_heads), dtype=torch.float32, device=device)
+        self._dsv4_attention_outputs = {
+            "shape": needed,
+            "output": output,
+            "lse": lse,
+        }
+        return output, lse
 
     def forward(
         self,
@@ -753,7 +837,8 @@ def _patch_deepseek_v4_backend() -> None:
             q_tokens = q3.shape[0]
 
             with _record_function("dsv4_bf16_attention_gather_swa"):
-                swa_idx, swa_len = _trim_rows(core.swa_page_indices, core.swa_topk_lengths, q_tokens)
+                swa_idx = core.swa_page_indices.squeeze(1) if core.swa_page_indices.ndim == 3 else core.swa_page_indices
+                swa_len = core.swa_topk_lengths
                 swa_topk = swa_idx.shape[-1]
                 total_topk = swa_topk
                 swa_buf = token_to_kv_pool.get_swa_key_buffer_radix(layer.layer_id).squeeze(2)
@@ -761,31 +846,66 @@ def _patch_deepseek_v4_backend() -> None:
 
             extra_idx = extra_len = extra_buf = None
 
+            if compress_ratio not in (4, 128):
+                with _record_function("dsv4_bf16_attention_direct_sparse"):
+                    out_buf, lse_buf = _get_reusable_attention_outputs(
+                        self, q_tokens, q3.shape[1], q3.shape[-1], q3.device
+                    )
+                    out, _lse = direct_sparse_attention(
+                        q3.contiguous(),
+                        swa_buf,
+                        swa_idx,
+                        swa_len,
+                        self.softmax_scale,
+                        attn_sink=attn_sink,
+                        output=out_buf,
+                        lse=lse_buf,
+                    )
+                return out
+
             if compress_ratio in (4, 128):
                 with _record_function(f"dsv4_bf16_attention_prepare_extra_r{compress_ratio}"):
                     if compress_ratio == 4:
-                        extra_idx, extra_len = _trim_rows(
-                            core.c4_sparse_page_indices, core.c4_sparse_topk_lengths, q_tokens
+                        extra_idx = (
+                            core.c4_sparse_page_indices.squeeze(1)
+                            if core.c4_sparse_page_indices.ndim == 3
+                            else core.c4_sparse_page_indices
                         )
+                        extra_len = core.c4_sparse_topk_lengths
                     else:
-                        extra_idx, extra_len = _trim_rows(
-                            core.c128_page_indices, core.c128_topk_lengths_clamp1, q_tokens
+                        extra_idx = (
+                            core.c128_page_indices.squeeze(1)
+                            if core.c128_page_indices.ndim == 3
+                            else core.c128_page_indices
                         )
+                        extra_len = core.c128_topk_lengths_clamp1
                     extra_buf = token_to_kv_pool.get_extra_key_buffer(layer.layer_id)
                     assert extra_buf is not None
                     extra_buf = extra_buf.squeeze(2)
                     total_topk = swa_topk + extra_idx.shape[-1]
 
+                with _record_function("dsv4_bf16_attention_direct_dual_sparse"):
+                    out_buf, lse_buf = _get_reusable_attention_outputs(
+                        self, q_tokens, q3.shape[1], q3.shape[-1], q3.device
+                    )
+                    out, _lse = direct_dual_sparse_attention(
+                        q3.contiguous(),
+                        swa_buf,
+                        swa_idx,
+                        swa_len,
+                        extra_buf,
+                        extra_idx,
+                        extra_len,
+                        self.softmax_scale,
+                        attn_sink=attn_sink,
+                        output=out_buf,
+                        lse=lse_buf,
+                    )
+                return out
+
             with _record_function("dsv4_bf16_attention_gather_triton"):
-                gathered = torch.empty(
-                    (q_tokens, total_topk, head_dim),
-                    dtype=torch.bfloat16,
-                    device=q3.device,
-                )
-                invalid_mask = torch.empty(
-                    (q_tokens, total_topk),
-                    dtype=torch.bool,
-                    device=q3.device,
+                gathered, invalid_mask = _get_reusable_sparse_buffers(
+                    self, q_tokens, total_topk, head_dim, q3.device
                 )
                 gather_bf16_kv_into(
                     swa_buf,

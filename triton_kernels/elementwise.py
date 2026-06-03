@@ -21,6 +21,14 @@ def _read_i32_from_plan_torch(plan_tensor: torch.Tensor, field: int) -> torch.Te
     raise TypeError(f"Unsupported plan dtype: {plan_tensor.dtype}")
 
 
+def _plan_tensor_as_i32(plan_tensor: torch.Tensor) -> torch.Tensor:
+    if plan_tensor.dtype == torch.int32:
+        return plan_tensor.view(torch.int32).reshape(plan_tensor.shape[0], -1)
+    if plan_tensor.dtype == torch.uint8:
+        return plan_tensor.view(torch.int32).reshape(plan_tensor.shape[0], -1)
+    raise TypeError(f"Unsupported plan dtype: {plan_tensor.dtype}")
+
+
 def fused_rope_inplace_torch(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -204,7 +212,12 @@ def compressor_positions_from_plan(
     plan_tensor: torch.Tensor,
     compress_ratio: int,
 ) -> torch.Tensor:
-    if plan_tensor.device.type != "cuda" or plan_tensor.dtype != torch.uint8:
+    if plan_tensor.device.type != "cuda":
+        return compressor_positions_from_plan_torch(plan_tensor, compress_ratio)
+    if plan_tensor.dtype == torch.int32:
+        plan_i32 = _plan_tensor_as_i32(plan_tensor)
+        return (plan_i32[:, 0] - int(compress_ratio)).clamp(min=0).to(torch.int32)
+    if plan_tensor.dtype != torch.uint8:
         return compressor_positions_from_plan_torch(plan_tensor, compress_ratio)
     rows = plan_tensor.shape[0]
     positions = torch.empty((rows,), dtype=torch.int32, device=plan_tensor.device)
@@ -285,7 +298,14 @@ def compressor_decode_mask_positions(
     plan_tensor: torch.Tensor,
     compress_ratio: int,
 ) -> torch.Tensor:
-    if kv_compressed.device.type != "cuda" or plan_tensor.dtype != torch.uint8:
+    if kv_compressed.device.type != "cuda":
+        return compressor_decode_mask_positions_torch(kv_compressed, plan_tensor, compress_ratio)
+    if plan_tensor.dtype == torch.int32:
+        seq_lens = _plan_tensor_as_i32(plan_tensor)[:, 0].to(torch.int32)
+        is_boundary = (seq_lens % int(compress_ratio) == 0).view(-1, *([1] * (kv_compressed.ndim - 1)))
+        kv_compressed.copy_(torch.where(is_boundary, kv_compressed, torch.zeros_like(kv_compressed)))
+        return (seq_lens - int(compress_ratio)).clamp(min=0)
+    if plan_tensor.dtype != torch.uint8:
         return compressor_decode_mask_positions_torch(kv_compressed, plan_tensor, compress_ratio)
     rows = kv_compressed.shape[0]
     dim = kv_compressed.numel() // max(rows, 1)
@@ -336,7 +356,14 @@ def compressor_prefill_metadata(
     out_loc: torch.Tensor,
     compress_ratio: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if plan_tensor.device.type != "cuda" or plan_tensor.dtype != torch.uint8:
+    if plan_tensor.device.type != "cuda":
+        return compressor_prefill_metadata_torch(plan_tensor, out_loc, compress_ratio)
+    if plan_tensor.dtype == torch.int32:
+        plan_i32 = _plan_tensor_as_i32(plan_tensor)
+        positions = (plan_i32[:, 0] - int(compress_ratio)).clamp(min=0).to(torch.int32)
+        ragged_ids = (plan_i32[:, 1] & 0xFFFF).to(torch.long)
+        return positions, out_loc[ragged_ids]
+    if plan_tensor.dtype != torch.uint8:
         return compressor_prefill_metadata_torch(plan_tensor, out_loc, compress_ratio)
     rows = plan_tensor.shape[0]
     positions = torch.empty((rows,), dtype=torch.int32, device=plan_tensor.device)
