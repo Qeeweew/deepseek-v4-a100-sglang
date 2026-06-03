@@ -298,6 +298,38 @@ def test_direct_sparse_attention_128_matches_gather_plus_unified():
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
+def test_direct_sparse_attention_masks_out_of_range_indices():
+    torch.manual_seed(232)
+    device = "cuda"
+    q_tokens, heads, head_dim, topk = 4, 8, 128, 16
+    q = torch.randn(q_tokens, heads, head_dim, device=device, dtype=torch.bfloat16)
+    buffer = torch.randn(64, head_dim, device=device, dtype=torch.bfloat16)
+    indices = torch.randint(-1, buffer.shape[0], (q_tokens, topk), device=device, dtype=torch.int32)
+    indices[0, 0] = buffer.shape[0]
+    indices[1, 1] = buffer.shape[0] + 17
+    lengths = torch.full((q_tokens,), topk, device=device, dtype=torch.int32)
+    attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
+    gathered, invalid = gather_bf16_kv(buffer, indices, lengths, topk)
+
+    from dsv4_a100_patch import _TRITON_COMMON
+
+    ref, _ = _TRITON_COMMON.run_unified_attention(
+        q.contiguous(),
+        gathered.contiguous(),
+        invalid.contiguous(),
+        head_dim,
+        head_dim**-0.5,
+        q_tokens,
+        heads,
+        topk,
+        head_dim,
+        attn_sink=attn_sink,
+    )
+    out, _ = direct_sparse_attention(q, buffer, indices, lengths, head_dim**-0.5, attn_sink=attn_sink)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
 def test_direct_dual_sparse_attention_matches_gather_plus_unified():
     torch.manual_seed(33)
     device = "cuda"
@@ -375,6 +407,47 @@ def test_direct_dual_sparse_attention_128_matches_gather_plus_unified():
     idx1 = torch.randint(-1, buf1.shape[0], (q_tokens, topk1), device=device, dtype=torch.int32)
     len0 = torch.randint(1, topk0 + 1, (q_tokens,), device=device, dtype=torch.int32)
     len1 = torch.randint(1, topk1 + 1, (q_tokens,), device=device, dtype=torch.int32)
+    attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
+    gathered0, invalid0 = gather_bf16_kv(buf0, idx0, len0, topk0)
+    gathered1, invalid1 = gather_bf16_kv(buf1, idx1, len1, topk1)
+    gathered = torch.cat([gathered0, gathered1], dim=1)
+    invalid = torch.cat([invalid0, invalid1], dim=1)
+
+    from dsv4_a100_patch import _TRITON_COMMON
+
+    ref, _ = _TRITON_COMMON.run_unified_attention(
+        q.contiguous(),
+        gathered.contiguous(),
+        invalid.contiguous(),
+        head_dim,
+        head_dim**-0.5,
+        q_tokens,
+        heads,
+        topk0 + topk1,
+        head_dim,
+        attn_sink=attn_sink,
+    )
+    out, _ = direct_dual_sparse_attention(
+        q, buf0, idx0, len0, buf1, idx1, len1, head_dim**-0.5, attn_sink=attn_sink
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+def test_direct_dual_sparse_attention_masks_out_of_range_indices():
+    torch.manual_seed(233)
+    device = "cuda"
+    q_tokens, heads, head_dim = 4, 8, 128
+    topk0, topk1 = 16, 12
+    q = torch.randn(q_tokens, heads, head_dim, device=device, dtype=torch.bfloat16)
+    buf0 = torch.randn(64, head_dim, device=device, dtype=torch.bfloat16)
+    buf1 = torch.randn(32, head_dim, device=device, dtype=torch.bfloat16)
+    idx0 = torch.randint(-1, buf0.shape[0], (q_tokens, topk0), device=device, dtype=torch.int32)
+    idx1 = torch.randint(-1, buf1.shape[0], (q_tokens, topk1), device=device, dtype=torch.int32)
+    idx0[0, 0] = buf0.shape[0] + 3
+    idx1[2, 2] = buf1.shape[0] + 5
+    len0 = torch.full((q_tokens,), topk0, device=device, dtype=torch.int32)
+    len1 = torch.full((q_tokens,), topk1, device=device, dtype=torch.int32)
     attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
     gathered0, invalid0 = gather_bf16_kv(buf0, idx0, len0, topk0)
     gathered1, invalid1 = gather_bf16_kv(buf1, idx1, len1, topk1)

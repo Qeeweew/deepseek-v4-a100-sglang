@@ -20,6 +20,7 @@ def _scatter_bf16_rows_kernel(
     loc_ptr,
     src_ptr,
     rows: tl.constexpr,
+    dst_total_rows: tl.constexpr,
     head_dim: tl.constexpr,
     dst_stride_row: tl.constexpr,
     dst_stride_dim: tl.constexpr,
@@ -34,16 +35,21 @@ def _scatter_bf16_rows_kernel(
     offsets_d = block_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_r = offs_r < rows
     mask_d = offsets_d < head_dim
-    dst_rows = tl.load(loc_ptr + offs_r, mask=mask_r, other=0).to(tl.int64)
+    dst_row_idx = tl.load(loc_ptr + offs_r, mask=mask_r, other=0).to(tl.int64)
+    valid_dst = mask_r & (dst_row_idx >= 0) & (dst_row_idx < dst_total_rows)
+    safe_dst_row_idx = tl.minimum(
+        tl.maximum(dst_row_idx, 0),
+        tl.maximum(dst_total_rows - 1, 0),
+    )
     vals = tl.load(
         src_ptr + offs_r[:, None] * src_stride_row + offsets_d[None, :] * src_stride_dim,
         mask=mask_r[:, None] & mask_d[None, :],
         other=0.0,
     )
     tl.store(
-        dst_ptr + dst_rows[:, None] * dst_stride_row + offsets_d[None, :] * dst_stride_dim,
+        dst_ptr + safe_dst_row_idx[:, None] * dst_stride_row + offsets_d[None, :] * dst_stride_dim,
         vals,
-        mask=mask_r[:, None] & mask_d[None, :],
+        mask=valid_dst[:, None] & mask_d[None, :],
     )
 
 
@@ -65,6 +71,7 @@ def scatter_bf16_rows(dst: torch.Tensor, loc: torch.Tensor, src: torch.Tensor) -
         loc,
         flat_src,
         rows,
+        flat_dst.shape[0],
         head_dim,
         flat_dst.stride(0),
         flat_dst.stride(1),
@@ -173,8 +180,9 @@ def gather_bf16_kv_torch(
     flat = buffer.view(-1, head_dim)
     lengths = lengths.to(torch.int64).view(q_tokens, 1)
     pos = torch.arange(total_topk, device=indices.device, dtype=torch.int64).view(1, total_topk)
-    valid = (pos < lengths) & (indices[:, :total_topk] >= 0)
-    rows = indices[:, :total_topk].to(torch.int64).clamp(min=0)
+    flat_rows = flat.shape[0]
+    valid = (pos < lengths) & (indices[:, :total_topk] >= 0) & (indices[:, :total_topk] < flat_rows)
+    rows = indices[:, :total_topk].to(torch.int64).clamp(min=0, max=max(0, flat_rows - 1))
     gathered = flat[rows]
     gathered = torch.where(valid.unsqueeze(-1), gathered, torch.zeros_like(gathered))
     return gathered, ~valid
@@ -187,7 +195,8 @@ def _gather_bf16_kv_kernel(
     lengths_ptr,
     out_ptr,
     invalid_ptr,
-    src_rows: tl.constexpr,
+    idx_rows: tl.constexpr,
+    buffer_rows: tl.constexpr,
     q_tokens: tl.constexpr,
     total_topk: tl.constexpr,
     head_dim: tl.constexpr,
@@ -210,15 +219,15 @@ def _gather_bf16_kv_kernel(
     offs_k = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
     offsets_d = block_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_d = offsets_d < head_dim
-    q_valid = q < src_rows
+    q_valid = q < idx_rows
     length = tl.load(lengths_ptr + q, mask=q_valid, other=0).to(tl.int64)
     row_index = tl.load(
         indices_ptr + q * idx_stride_q + offs_k * idx_stride_k,
         mask=q_valid & (offs_k < total_topk),
         other=-1,
     ).to(tl.int64)
-    valid = q_valid & (offs_k < length) & (row_index >= 0) & (offs_k < total_topk)
-    safe_row = tl.maximum(row_index, 0)
+    valid = q_valid & (offs_k < length) & (row_index >= 0) & (row_index < buffer_rows) & (offs_k < total_topk)
+    safe_row = tl.minimum(tl.maximum(row_index, 0), tl.maximum(buffer_rows - 1, 0))
     vals = tl.load(
         buffer_ptr + safe_row[:, None] * buffer_stride_row + offsets_d[None, :] * buffer_stride_d,
         mask=valid[:, None] & mask_d[None, :],
@@ -247,11 +256,12 @@ def _launch_gather(
     out_topk_offset: int = 0,
 ) -> None:
     q_tokens = out.shape[0]
-    src_rows = indices.shape[0]
+    idx_rows = indices.shape[0]
     head_dim = buffer.shape[-1]
     if q_tokens == 0 or total_topk == 0:
         return
     flat = buffer.view(-1, head_dim)
+    buffer_rows = flat.shape[0]
     block_d = min(1024, triton.next_power_of_2(max(1, head_dim)))
     # Larger K tiles reduce launch overhead on narrower head dimensions.
     block_k = 16 if head_dim <= 256 else 8
@@ -262,7 +272,8 @@ def _launch_gather(
         lengths.to(torch.int32) if lengths.dtype not in (torch.int32, torch.int64) else lengths,
         out,
         invalid_mask,
-        src_rows,
+        idx_rows,
+        buffer_rows,
         q_tokens,
         total_topk,
         head_dim,

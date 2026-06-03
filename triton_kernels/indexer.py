@@ -144,6 +144,7 @@ def _bf16_paged_mqa_logits_kernel(
     page_table_ptr,
     out_ptr,
     max_seq_len: tl.constexpr,
+    k_pages: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     q_stride_b: tl.constexpr,
@@ -175,6 +176,8 @@ def _bf16_paged_mqa_logits_kernel(
         mask=valid_l,
         other=0,
     ).to(tl.int64)
+    valid_page = valid_l & (page_ids >= 0) & (page_ids < k_pages)
+    safe_page_ids = tl.minimum(tl.maximum(page_ids, 0), tl.maximum(k_pages - 1, 0))
 
     acc = tl.zeros((BLOCK_L, BLOCK_H), dtype=tl.float32)
     offs_h = tl.arange(0, BLOCK_H)
@@ -192,10 +195,10 @@ def _bf16_paged_mqa_logits_kernel(
         ).to(tl.float32)
         k_vals = tl.load(
             k_ptr
-            + page_ids[:, None] * k_stride_page
+            + safe_page_ids[:, None] * k_stride_page
             + slot_offsets[:, None] * k_stride_block
             + offs_d[None, :] * k_stride_d,
-            mask=valid_l[:, None] & mask_d[None, :],
+            mask=valid_page[:, None] & mask_d[None, :],
             other=0.0,
         )
         acc += tl.dot(k_vals.to(tl.float32), q_vals, input_precision="tf32")
@@ -253,6 +256,7 @@ def bf16_paged_mqa_logits(
         page_table,
         out,
         int(max_seq_len),
+        kvcache_bf16.shape[0],
         int(num_heads),
         int(head_dim),
         q.stride(0),

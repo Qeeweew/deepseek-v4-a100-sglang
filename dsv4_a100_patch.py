@@ -1,5 +1,7 @@
 import importlib.util
+import contextlib
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -14,8 +16,124 @@ logger = logging.getLogger(__name__)
 _PATCH_APPLIED = False
 
 
+def _env_enabled(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _device_key(device: torch.device) -> int:
+    return device.index if device.type == "cuda" else -1
+
+
+def _get_tensor_cache(obj, attr: str) -> dict:
+    cache = getattr(obj, attr, None)
+    if cache is None:
+        cache = {}
+        setattr(obj, attr, cache)
+    return cache
+
+
+def _can_sync_cuda() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return not torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return True
+
+
+@contextlib.contextmanager
 def _record_function(name: str):
-    return torch.profiler.record_function(f"dsv4_a100_patch::{name}")
+    with torch.profiler.record_function(f"dsv4_a100_patch::{name}"):
+        yield
+    if _env_enabled("SGLANG_DSV4_A100_DEBUG_SYNC", "0") and _can_sync_cuda():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            logger.exception("CUDA sync failed after dsv4_a100_patch::%s", name)
+            raise
+
+
+def _apply_rotary_tail_torch(
+    x: torch.Tensor,
+    freqs_cis_or_real: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    freqs = (
+        torch.view_as_real(freqs_cis_or_real).flatten(-2)
+        if freqs_cis_or_real.is_complex()
+        else freqs_cis_or_real
+    )
+    rope_dim = freqs.shape[-1]
+    if rope_dim == 0:
+        return x
+    if rope_dim % 2 != 0 or rope_dim > x.shape[-1]:
+        raise ValueError(f"invalid rotary dim {rope_dim} for q dim {x.shape[-1]}")
+
+    pos = positions.to(torch.long).clamp_(0, freqs.shape[0] - 1)
+    freq = freqs.index_select(0, pos).to(torch.float32)
+    base_dim = x.shape[-1] - rope_dim
+    tail = x[..., base_dim:].to(torch.float32).reshape(
+        x.shape[0], x.shape[1], rope_dim // 2, 2
+    )
+    freq = freq.reshape(x.shape[0], 1, rope_dim // 2, 2)
+
+    even = tail[..., 0]
+    odd = tail[..., 1]
+    freq_even = freq[..., 0]
+    freq_odd = freq[..., 1]
+    rotated = torch.stack(
+        (even * freq_even - odd * freq_odd, even * freq_odd + odd * freq_even),
+        dim=-1,
+    ).reshape(x.shape[0], x.shape[1], rope_dim)
+    x[..., base_dim:] = rotated.to(x.dtype)
+    return x
+
+
+def _hadamard_transform_torch(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if x.shape[-1] & (x.shape[-1] - 1):
+        raise ValueError(f"hadamard dim must be a power of 2, got {x.shape[-1]}")
+    y = x.to(torch.float32)
+    n = y.shape[-1]
+    h = 1
+    while h < n:
+        y = y.reshape(*y.shape[:-1], -1, h * 2)
+        left = y[..., :h].clone()
+        right = y[..., h:].clone()
+        y[..., :h] = left + right
+        y[..., h:] = left - right
+        y = y.reshape(*x.shape)
+        h *= 2
+    y = (y * (n**-0.5)).to(torch.bfloat16)
+    if out is not None:
+        out.copy_(y)
+        return out
+    return y
+
+
+def _bf16_indexer_q_torch_fallback(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis_or_real: torch.Tensor,
+    positions: torch.Tensor,
+    q_out: torch.Tensor | None = None,
+    weights_out: torch.Tensor | None = None,
+    allow_inplace_input: bool = False,
+):
+    if allow_inplace_input and q_input.dtype == torch.bfloat16 and q_input.is_contiguous():
+        q = q_input
+    else:
+        q = q_input.contiguous().to(torch.bfloat16)
+    _apply_rotary_tail_torch(q, freqs_cis_or_real, positions)
+    q = _hadamard_transform_torch(q, q_out)
+    weights = (weight.float() * float(weight_scale)).unsqueeze(-1)
+    if weights_out is not None:
+        weights_out.copy_(weights)
+        weights = weights_out
+    return q, weights
 
 
 def _load_module(name: str, path: Path):
@@ -404,25 +522,46 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
     ):
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        q_out = getattr(self, "_dsv4_bf16_indexer_q_out", None)
-        weights_out = getattr(self, "_dsv4_bf16_indexer_weights_out", None)
         scratch_q = getattr(self, "_dsv4_bf16_indexer_scratch_q", None)
         freqs_real = getattr(self, "_dsv4_bf16_indexer_freqs_real", None)
-        expected_q_shape = q.shape
-        expected_w_shape = (*weight.shape, 1)
-        if q_out is None or q_out.shape != expected_q_shape or q_out.device != q.device:
-            q_out = torch.empty(expected_q_shape, device=q.device, dtype=torch.bfloat16)
-            self._dsv4_bf16_indexer_q_out = q_out
-        if (
-            weights_out is None
-            or weights_out.shape != expected_w_shape
-            or weights_out.device != weight.device
-        ):
-            weights_out = torch.empty(expected_w_shape, device=weight.device, dtype=torch.float32)
-            self._dsv4_bf16_indexer_weights_out = weights_out
+        q_cache = _get_tensor_cache(self, "_dsv4_bf16_indexer_q_out_cache")
+        weight_cache = _get_tensor_cache(self, "_dsv4_bf16_indexer_weights_out_cache")
+        q_key = (tuple(q.shape[1:]), _device_key(q.device))
+        w_shape = (*weight.shape, 1)
+        w_key = (tuple(w_shape[1:]), _device_key(weight.device))
+        q_entry = q_cache.get(q_key)
+        q_out = None if q_entry is None else q_entry["tensor"]
+        if q_out is None or q_out.shape[0] < q.shape[0]:
+            if q_out is not None:
+                q_entry.setdefault("retired", []).append(q_out)
+            q_out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
+            q_cache[q_key] = {"tensor": q_out, "retired": []}
+        else:
+            q_out = q_out[: q.shape[0]]
+        w_entry = weight_cache.get(w_key)
+        weights_out = None if w_entry is None else w_entry["tensor"]
+        if weights_out is None or weights_out.shape[0] < w_shape[0]:
+            if weights_out is not None:
+                w_entry.setdefault("retired", []).append(weights_out)
+            weights_out = torch.empty(w_shape, device=weight.device, dtype=torch.float32)
+            weight_cache[w_key] = {"tensor": weights_out, "retired": []}
+        else:
+            weights_out = weights_out[: w_shape[0]]
         if freqs_real is None or freqs_real.device != self.freqs_cis.device:
             freqs_real = torch.view_as_real(self.freqs_cis).flatten(-2).contiguous()
             self._dsv4_bf16_indexer_freqs_real = freqs_real
+        if _env_enabled("SGLANG_DSV4_A100_TORCH_INDEXER_Q", "1"):
+            with _record_function("c4_bf16_indexer_q_torch_fallback"):
+                return _bf16_indexer_q_torch_fallback(
+                    q,
+                    weight,
+                    self.weight_scale,
+                    freqs_real,
+                    positions,
+                    q_out=q_out,
+                    weights_out=weights_out,
+                    allow_inplace_input=True,
+                )
         return bf16_indexer_q(
             q,
             weight,
@@ -755,9 +894,24 @@ def _gather_bf16_kv(buffer: torch.Tensor, indices: torch.Tensor, lengths: torch.
         return gather_bf16_kv(buffer, indices, lengths, total_topk)
 
 
+def _prepare_sparse_metadata(
+    page_indices: torch.Tensor,
+    lengths: torch.Tensor,
+    q_tokens: int,
+):
+    if page_indices.ndim == 3:
+        page_indices = page_indices.squeeze(1)
+    if page_indices.shape[0] != q_tokens or lengths.shape[0] != q_tokens:
+        page_indices, lengths = _trim_rows(page_indices, lengths, q_tokens)
+    else:
+        lengths = lengths.to(torch.int32)
+    lengths = torch.clamp(lengths, min=0, max=page_indices.shape[-1])
+    return page_indices, lengths
+
+
 def _patch_deepseek_v4_backend() -> None:
     from sglang.srt.layers.attention import deepseek_v4_backend as dsv4_backend
-    from triton_kernels import direct_dual_sparse_attention, direct_sparse_attention, gather_bf16_kv_into
+    from triton_kernels import gather_bf16_kv_into
 
     original_forward = dsv4_backend.DeepseekV4AttnBackend.forward
     _pad_tensor_to_size = dsv4_backend._pad_tensor_to_size
@@ -770,16 +924,27 @@ def _patch_deepseek_v4_backend() -> None:
         head_dim: int,
         device: torch.device,
     ):
-        cached = getattr(self, "_dsv4_sparse_buffers", None)
-        needed = (q_tokens, total_topk, head_dim, device.index if device.type == "cuda" else -1)
-        if cached is not None and cached["shape"] == needed:
-            return cached["gathered"], cached["invalid_mask"]
+        cache = _get_tensor_cache(self, "_dsv4_sparse_buffers")
+        needed = (head_dim, _device_key(device))
+        cached = cache.get(needed)
+        if (
+            cached is not None
+            and cached["gathered"].shape[0] >= q_tokens
+            and cached["gathered"].shape[1] >= total_topk
+        ):
+            return (
+                cached["gathered"][:q_tokens, :total_topk, :],
+                cached["invalid_mask"][:q_tokens, :total_topk],
+            )
+        retired = [] if cached is None else cached.setdefault("retired", [])
+        if cached is not None:
+            retired.extend([cached["gathered"], cached["invalid_mask"]])
         gathered = torch.empty((q_tokens, total_topk, head_dim), dtype=torch.bfloat16, device=device)
         invalid_mask = torch.empty((q_tokens, total_topk), dtype=torch.bool, device=device)
-        self._dsv4_sparse_buffers = {
-            "shape": needed,
+        cache[needed] = {
             "gathered": gathered,
             "invalid_mask": invalid_mask,
+            "retired": retired,
         }
         return gathered, invalid_mask
 
@@ -790,16 +955,20 @@ def _patch_deepseek_v4_backend() -> None:
         head_dim: int,
         device: torch.device,
     ):
-        cached = getattr(self, "_dsv4_attention_outputs", None)
-        needed = (q_tokens, q_heads, head_dim, device.index if device.type == "cuda" else -1)
-        if cached is not None and cached["shape"] == needed:
-            return cached["output"], cached["lse"]
+        cache = _get_tensor_cache(self, "_dsv4_attention_outputs")
+        needed = (q_heads, head_dim, _device_key(device))
+        cached = cache.get(needed)
+        if cached is not None and cached["output"].shape[0] >= q_tokens:
+            return cached["output"][:q_tokens], cached["lse"][:q_tokens]
+        retired = [] if cached is None else cached.setdefault("retired", [])
+        if cached is not None:
+            retired.extend([cached["output"], cached["lse"]])
         output = torch.empty((q_tokens, q_heads, head_dim), dtype=torch.bfloat16, device=device)
         lse = torch.empty((q_tokens, q_heads), dtype=torch.float32, device=device)
-        self._dsv4_attention_outputs = {
-            "shape": needed,
+        cache[needed] = {
             "output": output,
             "lse": lse,
+            "retired": retired,
         }
         return output, lse
 
@@ -840,35 +1009,13 @@ def _patch_deepseek_v4_backend() -> None:
             with _record_function("dsv4_bf16_attention_gather_swa"):
                 swa_idx = core.swa_page_indices.squeeze(1) if core.swa_page_indices.ndim == 3 else core.swa_page_indices
                 swa_len = core.swa_topk_lengths
+                swa_idx, swa_len = _prepare_sparse_metadata(swa_idx, swa_len, q_tokens)
                 swa_topk = swa_idx.shape[-1]
                 total_topk = swa_topk
                 swa_buf = token_to_kv_pool.get_swa_key_buffer_radix(layer.layer_id).squeeze(2)
                 head_dim = swa_buf.shape[-1]
 
-            if self.mtp_enabled:
-                if swa_idx.shape[0] != q_tokens:
-                    swa_idx = _pad_tensor_to_size(swa_idx, q_tokens, value=0)
-                if swa_len.shape[0] != q_tokens:
-                    swa_len = _pad_tensor_to_size(swa_len, q_tokens, value=1)
-
             extra_idx = extra_len = extra_buf = None
-
-            if compress_ratio not in (4, 128):
-                with _record_function("dsv4_bf16_attention_direct_sparse"):
-                    out_buf, lse_buf = _get_reusable_attention_outputs(
-                        self, q_tokens, q3.shape[1], q3.shape[-1], q3.device
-                    )
-                    out, _lse = direct_sparse_attention(
-                        q3.contiguous(),
-                        swa_buf,
-                        swa_idx,
-                        swa_len,
-                        self.softmax_scale,
-                        attn_sink=attn_sink,
-                        output=out_buf,
-                        lse=lse_buf,
-                    )
-                return out
 
             if compress_ratio in (4, 128):
                 with _record_function(f"dsv4_bf16_attention_prepare_extra_r{compress_ratio}"):
@@ -886,35 +1033,13 @@ def _patch_deepseek_v4_backend() -> None:
                             else core.c128_page_indices
                         )
                         extra_len = core.c128_topk_lengths_clamp1
+                    extra_idx, extra_len = _prepare_sparse_metadata(
+                        extra_idx, extra_len, q_tokens
+                    )
                     extra_buf = token_to_kv_pool.get_extra_key_buffer(layer.layer_id)
                     assert extra_buf is not None
                     extra_buf = extra_buf.squeeze(2)
                     total_topk = swa_topk + extra_idx.shape[-1]
-
-                    if self.mtp_enabled:
-                        if extra_idx.shape[0] != q_tokens:
-                            extra_idx = _pad_tensor_to_size(extra_idx, q_tokens, value=0)
-                        if extra_len.shape[0] != q_tokens:
-                            extra_len = _pad_tensor_to_size(extra_len, q_tokens, value=1)
-
-                with _record_function("dsv4_bf16_attention_direct_dual_sparse"):
-                    out_buf, lse_buf = _get_reusable_attention_outputs(
-                        self, q_tokens, q3.shape[1], q3.shape[-1], q3.device
-                    )
-                    out, _lse = direct_dual_sparse_attention(
-                        q3.contiguous(),
-                        swa_buf,
-                        swa_idx,
-                        swa_len,
-                        extra_buf,
-                        extra_idx,
-                        extra_len,
-                        self.softmax_scale,
-                        attn_sink=attn_sink,
-                        output=out_buf,
-                        lse=lse_buf,
-                    )
-                return out
 
             with _record_function("dsv4_bf16_attention_gather_triton"):
                 gathered, invalid_mask = _get_reusable_sparse_buffers(

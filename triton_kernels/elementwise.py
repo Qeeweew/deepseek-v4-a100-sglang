@@ -203,7 +203,7 @@ def _compressor_positions_from_plan_kernel(
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < rows
-    seq_len = _load_plan_i32(plan_ptr, offsets, plan_stride_row, 0)
+    seq_len = _load_plan_i32(plan_ptr, offsets, plan_stride_row, 0, mask)
     positions = tl.maximum(seq_len - compress_ratio, 0)
     tl.store(positions_ptr + offsets, positions, mask=mask)
 
@@ -258,12 +258,12 @@ def compressor_prefill_metadata_torch(
 
 
 @triton.jit
-def _load_plan_i32(plan_ptr, row, stride_row: tl.constexpr, field: tl.constexpr):
+def _load_plan_i32(plan_ptr, row, stride_row: tl.constexpr, field: tl.constexpr, mask, other: tl.constexpr = 0):
     base = row * stride_row + field * 4
-    b0 = tl.load(plan_ptr + base + 0).to(tl.int32)
-    b1 = tl.load(plan_ptr + base + 1).to(tl.int32)
-    b2 = tl.load(plan_ptr + base + 2).to(tl.int32)
-    b3 = tl.load(plan_ptr + base + 3).to(tl.int32)
+    b0 = tl.load(plan_ptr + base + 0, mask=mask, other=other).to(tl.int32)
+    b1 = tl.load(plan_ptr + base + 1, mask=mask, other=other).to(tl.int32)
+    b2 = tl.load(plan_ptr + base + 2, mask=mask, other=other).to(tl.int32)
+    b3 = tl.load(plan_ptr + base + 3, mask=mask, other=other).to(tl.int32)
     return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 
 
@@ -284,7 +284,7 @@ def _compressor_decode_mask_positions_kernel(
     block_d = tl.program_id(1)
     offsets_d = block_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_d = offsets_d < dim
-    seq_len = _load_plan_i32(plan_ptr, row, plan_stride_row, 0)
+    seq_len = _load_plan_i32(plan_ptr, row, plan_stride_row, 0, row < rows)
     boundary = (seq_len % compress_ratio) == 0
     vals = tl.load(kv_ptr + row * kv_stride_row + offsets_d * kv_stride_dim, mask=mask_d, other=0.0)
     vals = tl.where(boundary, vals, 0.0)
@@ -343,8 +343,8 @@ def _compressor_prefill_metadata_kernel(
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < rows
-    seq_len = _load_plan_i32(plan_ptr, offsets, plan_stride_row, 0)
-    ragged_id = _load_plan_i32(plan_ptr, offsets, plan_stride_row, 1) & 0xFFFF
+    seq_len = _load_plan_i32(plan_ptr, offsets, plan_stride_row, 0, mask)
+    ragged_id = _load_plan_i32(plan_ptr, offsets, plan_stride_row, 1, mask) & 0xFFFF
     positions = tl.maximum(seq_len - compress_ratio, 0)
     selected = tl.load(out_loc_ptr + ragged_id, mask=mask, other=0)
     tl.store(positions_ptr + offsets, positions, mask=mask)

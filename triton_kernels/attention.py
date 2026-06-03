@@ -35,6 +35,7 @@ def _direct_sparse_decode_kernel(
     Output,
     LSE,
     sm_scale,
+    kv_rows,
     total_tokens,
     total_tokens_bucket,
     h_q,
@@ -121,22 +122,23 @@ def _direct_sparse_decode_kernel(
         offs_n = n_start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < total_topk
         row_idx = tl.load(idx_base + offs_n * stride_idx_k, mask=mask_n, other=-1).to(tl.int64)
-        valid = mask_n & (offs_n < seq_len) & (row_idx >= 0)
+        valid = mask_n & (offs_n < seq_len) & (row_idx >= 0) & (row_idx < kv_rows)
+        safe_row_idx = tl.minimum(tl.maximum(row_idx, 0), tl.maximum(kv_rows - 1, 0))
 
         qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
-        k_ptrs = KV + row_idx[:, None] * stride_kv_t + offs_d_0[None, :] * stride_kv_d
+        k_ptrs = KV + safe_row_idx[:, None] * stride_kv_t + offs_d_0[None, :] * stride_kv_d
         k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d_0[None, :], other=0.0).to(tl.bfloat16)
         qk += tl.dot(q_chunk_0, tl.trans(k_chunk))
         if NUM_QK_BLOCKS > 1:
-            k_ptrs = KV + row_idx[:, None] * stride_kv_t + offs_d_1[None, :] * stride_kv_d
+            k_ptrs = KV + safe_row_idx[:, None] * stride_kv_t + offs_d_1[None, :] * stride_kv_d
             k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d_1[None, :], other=0.0).to(tl.bfloat16)
             qk += tl.dot(q_chunk_1, tl.trans(k_chunk))
         if NUM_QK_BLOCKS > 2:
-            k_ptrs = KV + row_idx[:, None] * stride_kv_t + offs_d_2[None, :] * stride_kv_d
+            k_ptrs = KV + safe_row_idx[:, None] * stride_kv_t + offs_d_2[None, :] * stride_kv_d
             k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d_2[None, :], other=0.0).to(tl.bfloat16)
             qk += tl.dot(q_chunk_2, tl.trans(k_chunk))
         if NUM_QK_BLOCKS > 3:
-            k_ptrs = KV + row_idx[:, None] * stride_kv_t + offs_d_3[None, :] * stride_kv_d
+            k_ptrs = KV + safe_row_idx[:, None] * stride_kv_t + offs_d_3[None, :] * stride_kv_d
             k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d_3[None, :], other=0.0).to(tl.bfloat16)
             qk += tl.dot(q_chunk_3, tl.trans(k_chunk))
 
@@ -151,25 +153,25 @@ def _direct_sparse_decode_kernel(
         p_bf16 = p.to(tl.bfloat16)
 
         offs_v = offs_d_0
-        v_ptrs = KV + row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
+        v_ptrs = KV + safe_row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
         v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
         acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, v)
 
         if NUM_V_BLOCKS > 1:
             offs_v = offs_d_1
-            v_ptrs = KV + row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
+            v_ptrs = KV + safe_row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
             v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
             acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, v)
 
         if NUM_V_BLOCKS > 2:
             offs_v = offs_d_2
-            v_ptrs = KV + row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
+            v_ptrs = KV + safe_row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
             v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
             acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, v)
 
         if NUM_V_BLOCKS > 3:
             offs_v = offs_d_3
-            v_ptrs = KV + row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
+            v_ptrs = KV + safe_row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
             v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
             acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, v)
 
@@ -270,6 +272,7 @@ def direct_sparse_attention(
         output,
         lse,
         sm_scale,
+        buffer.view(-1, d_v).shape[0],
         total_tokens,
         _bucket_total_tokens(total_tokens),
         h_q,
@@ -325,6 +328,8 @@ def _direct_dual_sparse_decode_kernel(
     Output,
     LSE,
     sm_scale,
+    kv0_rows,
+    kv1_rows,
     total_tokens,
     total_tokens_bucket,
     h_q,
@@ -421,6 +426,7 @@ def _direct_dual_sparse_decode_kernel(
             idx_base = idx0_base
             seq_len = seq_len0
             kv_ptr = KV0
+            kv_rows = kv0_rows
             stride_kv_t = stride_kv0_t
             stride_kv_d = stride_kv0_d
             stride_idx_k = stride_idx0_k
@@ -429,6 +435,7 @@ def _direct_dual_sparse_decode_kernel(
             idx_base = idx1_base
             seq_len = seq_len1
             kv_ptr = KV1
+            kv_rows = kv1_rows
             stride_kv_t = stride_kv1_t
             stride_kv_d = stride_kv1_d
             stride_idx_k = stride_idx1_k
@@ -441,22 +448,23 @@ def _direct_dual_sparse_decode_kernel(
                 mask=mask_n,
                 other=-1,
             ).to(tl.int64)
-            valid = mask_n & (offs_n < seq_len) & (row_idx >= 0)
+            valid = mask_n & (offs_n < seq_len) & (row_idx >= 0) & (row_idx < kv_rows)
+            safe_row_idx = tl.minimum(tl.maximum(row_idx, 0), tl.maximum(kv_rows - 1, 0))
 
             qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
-            k_ptrs = kv_ptr + row_idx[:, None] * stride_kv_t + offs_d_0[None, :] * stride_kv_d
+            k_ptrs = kv_ptr + safe_row_idx[:, None] * stride_kv_t + offs_d_0[None, :] * stride_kv_d
             k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d_0[None, :], other=0.0).to(tl.bfloat16)
             qk += tl.dot(q_chunk_0, tl.trans(k_chunk))
             if NUM_QK_BLOCKS > 1:
-                k_ptrs = kv_ptr + row_idx[:, None] * stride_kv_t + offs_d_1[None, :] * stride_kv_d
+                k_ptrs = kv_ptr + safe_row_idx[:, None] * stride_kv_t + offs_d_1[None, :] * stride_kv_d
                 k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d_1[None, :], other=0.0).to(tl.bfloat16)
                 qk += tl.dot(q_chunk_1, tl.trans(k_chunk))
             if NUM_QK_BLOCKS > 2:
-                k_ptrs = kv_ptr + row_idx[:, None] * stride_kv_t + offs_d_2[None, :] * stride_kv_d
+                k_ptrs = kv_ptr + safe_row_idx[:, None] * stride_kv_t + offs_d_2[None, :] * stride_kv_d
                 k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d_2[None, :], other=0.0).to(tl.bfloat16)
                 qk += tl.dot(q_chunk_2, tl.trans(k_chunk))
             if NUM_QK_BLOCKS > 3:
-                k_ptrs = kv_ptr + row_idx[:, None] * stride_kv_t + offs_d_3[None, :] * stride_kv_d
+                k_ptrs = kv_ptr + safe_row_idx[:, None] * stride_kv_t + offs_d_3[None, :] * stride_kv_d
                 k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d_3[None, :], other=0.0).to(tl.bfloat16)
                 qk += tl.dot(q_chunk_3, tl.trans(k_chunk))
 
@@ -471,25 +479,25 @@ def _direct_dual_sparse_decode_kernel(
             p_bf16 = p.to(tl.bfloat16)
 
             offs_v = offs_d_0
-            v_ptrs = kv_ptr + row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
+            v_ptrs = kv_ptr + safe_row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
             v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
             acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, v)
 
             if NUM_V_BLOCKS > 1:
                 offs_v = offs_d_1
-                v_ptrs = kv_ptr + row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
+                v_ptrs = kv_ptr + safe_row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
                 v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
                 acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, v)
 
             if NUM_V_BLOCKS > 2:
                 offs_v = offs_d_2
-                v_ptrs = kv_ptr + row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
+                v_ptrs = kv_ptr + safe_row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
                 v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
                 acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, v)
 
             if NUM_V_BLOCKS > 3:
                 offs_v = offs_d_3
-                v_ptrs = kv_ptr + row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
+                v_ptrs = kv_ptr + safe_row_idx[:, None] * stride_kv_t + offs_v[None, :] * stride_kv_d
                 v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
                 acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, v)
 
@@ -579,6 +587,8 @@ def direct_dual_sparse_attention(
         output,
         lse,
         sm_scale,
+        primary_buffer.view(-1, d_v).shape[0],
+        extra_buffer.view(-1, d_v).shape[0],
         total_tokens,
         _bucket_total_tokens(total_tokens),
         h_q,
