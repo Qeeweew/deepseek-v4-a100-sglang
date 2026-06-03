@@ -760,6 +760,7 @@ def _patch_deepseek_v4_backend() -> None:
     from triton_kernels import direct_dual_sparse_attention, direct_sparse_attention, gather_bf16_kv_into
 
     original_forward = dsv4_backend.DeepseekV4AttnBackend.forward
+    _pad_tensor_to_size = dsv4_backend._pad_tensor_to_size
     run_unified_attention = _TRITON_COMMON.run_unified_attention
 
     def _get_reusable_sparse_buffers(
@@ -844,6 +845,12 @@ def _patch_deepseek_v4_backend() -> None:
                 swa_buf = token_to_kv_pool.get_swa_key_buffer_radix(layer.layer_id).squeeze(2)
                 head_dim = swa_buf.shape[-1]
 
+            if self.mtp_enabled:
+                if swa_idx.shape[0] != q_tokens:
+                    swa_idx = _pad_tensor_to_size(swa_idx, q_tokens, value=0)
+                if swa_len.shape[0] != q_tokens:
+                    swa_len = _pad_tensor_to_size(swa_len, q_tokens, value=1)
+
             extra_idx = extra_len = extra_buf = None
 
             if compress_ratio not in (4, 128):
@@ -883,6 +890,12 @@ def _patch_deepseek_v4_backend() -> None:
                     assert extra_buf is not None
                     extra_buf = extra_buf.squeeze(2)
                     total_topk = swa_topk + extra_idx.shape[-1]
+
+                    if self.mtp_enabled:
+                        if extra_idx.shape[0] != q_tokens:
+                            extra_idx = _pad_tensor_to_size(extra_idx, q_tokens, value=0)
+                        if extra_len.shape[0] != q_tokens:
+                            extra_len = _pad_tensor_to_size(extra_len, q_tokens, value=1)
 
                 with _record_function("dsv4_bf16_attention_direct_dual_sparse"):
                     out_buf, lse_buf = _get_reusable_attention_outputs(
