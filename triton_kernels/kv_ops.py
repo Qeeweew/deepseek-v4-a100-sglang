@@ -253,7 +253,8 @@ def _launch_gather(
         return
     flat = buffer.view(-1, head_dim)
     block_d = min(1024, triton.next_power_of_2(max(1, head_dim)))
-    block_k = 8
+    # Larger K tiles reduce launch overhead on narrower head dimensions.
+    block_k = 16 if head_dim <= 256 else 8
     grid = (q_tokens, triton.cdiv(total_topk, block_k), triton.cdiv(head_dim, block_d))
     _gather_bf16_kv_kernel[grid](
         flat,
