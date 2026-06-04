@@ -195,6 +195,57 @@ def test_gather_bf16_kv_accuracy_and_perf():
     assert triton_graph_ms > 0
 
 
+def test_gather_bf16_kv_handles_short_indices():
+    torch.manual_seed(301)
+    device = "cuda"
+    q_tokens, idx_topk, total_topk, head_dim = 7, 5, 13, 64
+    buffer = torch.randn(256, head_dim, device=device, dtype=torch.bfloat16)
+    indices = torch.randint(-2, buffer.shape[0] + 2, (q_tokens, idx_topk), device=device, dtype=torch.int32)
+    lengths = torch.full((q_tokens,), total_topk, device=device, dtype=torch.int32)
+
+    out_ref, mask_ref = gather_bf16_kv_torch(buffer, indices, lengths, total_topk)
+    out_tri, mask_tri = gather_bf16_kv(buffer, indices, lengths, total_topk)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_tri, out_ref, atol=0, rtol=0)
+    torch.testing.assert_close(mask_tri, mask_ref, atol=0, rtol=0)
+    torch.testing.assert_close(out_tri[:, idx_topk:], torch.zeros_like(out_tri[:, idx_topk:]), atol=0, rtol=0)
+    assert mask_tri[:, idx_topk:].all()
+
+
+def test_gather_bf16_kv_into_clamps_to_output_capacity():
+    torch.manual_seed(302)
+    device = "cuda"
+    q_tokens, total_topk, head_dim = 6, 12, 64
+    out_topk_offset, out_topk_capacity = 4, 10
+    writable_topk = out_topk_capacity - out_topk_offset
+    buffer = torch.randn(512, head_dim, device=device, dtype=torch.bfloat16)
+    indices = torch.randint(-2, buffer.shape[0] + 2, (q_tokens, total_topk), device=device, dtype=torch.int32)
+    lengths = torch.full((q_tokens,), total_topk, device=device, dtype=torch.int32)
+
+    out_ref, mask_ref = gather_bf16_kv_torch(buffer, indices, lengths, total_topk)
+    out_into = torch.empty(q_tokens, out_topk_capacity, head_dim, device=device, dtype=torch.bfloat16)
+    mask_into = torch.empty(q_tokens, out_topk_capacity, device=device, dtype=torch.bool)
+    out_into.fill_(7)
+    mask_into.fill_(False)
+
+    gather_bf16_kv_into(buffer, indices, lengths, total_topk, out_into, mask_into, out_topk_offset)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out_into[:, out_topk_offset:],
+        out_ref[:, :writable_topk],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(mask_into[:, out_topk_offset:], mask_ref[:, :writable_topk], atol=0, rtol=0)
+    torch.testing.assert_close(
+        out_into[:, :out_topk_offset],
+        torch.full_like(out_into[:, :out_topk_offset], 7),
+        atol=0,
+        rtol=0,
+    )
+    assert not mask_into[:, :out_topk_offset].any()
+
+
 def test_trim_and_pad_rows_accuracy():
     torch.manual_seed(31)
     device = "cuda"

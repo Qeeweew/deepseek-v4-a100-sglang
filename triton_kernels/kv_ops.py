@@ -178,14 +178,27 @@ def gather_bf16_kv_torch(
     q_tokens = indices.shape[0]
     head_dim = buffer.shape[-1]
     flat = buffer.view(-1, head_dim)
-    lengths = lengths.to(torch.int64).view(q_tokens, 1)
-    pos = torch.arange(total_topk, device=indices.device, dtype=torch.int64).view(1, total_topk)
+    gathered = torch.zeros((q_tokens, total_topk, head_dim), device=buffer.device, dtype=buffer.dtype)
+    invalid = torch.ones((q_tokens, total_topk), device=indices.device, dtype=torch.bool)
+    available_topk = min(total_topk, indices.shape[1])
+    if q_tokens == 0 or available_topk == 0:
+        return gathered, invalid
+    if lengths.shape[0] < q_tokens:
+        padded_lengths = torch.zeros((q_tokens,), device=lengths.device, dtype=torch.int64)
+        padded_lengths[: lengths.shape[0]] = lengths.to(torch.int64)
+        lengths = padded_lengths
+    else:
+        lengths = lengths[:q_tokens].to(torch.int64)
+    lengths = lengths.view(q_tokens, 1)
+    pos = torch.arange(available_topk, device=indices.device, dtype=torch.int64).view(1, available_topk)
     flat_rows = flat.shape[0]
-    valid = (pos < lengths) & (indices[:, :total_topk] >= 0) & (indices[:, :total_topk] < flat_rows)
-    rows = indices[:, :total_topk].to(torch.int64).clamp(min=0, max=max(0, flat_rows - 1))
-    gathered = flat[rows]
-    gathered = torch.where(valid.unsqueeze(-1), gathered, torch.zeros_like(gathered))
-    return gathered, ~valid
+    idx = indices[:, :available_topk]
+    valid = (pos < lengths) & (idx >= 0) & (idx < flat_rows)
+    rows = idx.to(torch.int64).clamp(min=0, max=max(0, flat_rows - 1))
+    partial = flat[rows]
+    gathered[:, :available_topk] = torch.where(valid.unsqueeze(-1), partial, torch.zeros_like(partial))
+    invalid[:, :available_topk] = ~valid
+    return gathered, invalid
 
 
 @triton.jit
@@ -196,8 +209,11 @@ def _gather_bf16_kv_kernel(
     out_ptr,
     invalid_ptr,
     idx_rows: tl.constexpr,
+    idx_topk: tl.constexpr,
+    lengths_rows: tl.constexpr,
     buffer_rows: tl.constexpr,
-    q_tokens: tl.constexpr,
+    out_rows: tl.constexpr,
+    out_topk_capacity: tl.constexpr,
     total_topk: tl.constexpr,
     head_dim: tl.constexpr,
     idx_stride_q: tl.constexpr,
@@ -219,30 +235,39 @@ def _gather_bf16_kv_kernel(
     offs_k = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
     offsets_d = block_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_d = offsets_d < head_dim
-    q_valid = q < idx_rows
-    length = tl.load(lengths_ptr + q, mask=q_valid, other=0).to(tl.int64)
+    out_k = offs_k + out_topk_offset
+    idx_valid = (q < idx_rows) & (offs_k < idx_topk)
+    out_valid = (q < out_rows) & (out_k < out_topk_capacity) & (offs_k < total_topk)
+    q_len_valid = q < lengths_rows
+    length = tl.load(lengths_ptr + q, mask=q_len_valid, other=0).to(tl.int64)
     row_index = tl.load(
         indices_ptr + q * idx_stride_q + offs_k * idx_stride_k,
-        mask=q_valid & (offs_k < total_topk),
+        mask=idx_valid & (offs_k < total_topk),
         other=-1,
     ).to(tl.int64)
-    valid = q_valid & (offs_k < length) & (row_index >= 0) & (row_index < buffer_rows) & (offs_k < total_topk)
+    valid = (
+        idx_valid
+        & q_len_valid
+        & (offs_k < length)
+        & (row_index >= 0)
+        & (row_index < buffer_rows)
+        & (offs_k < total_topk)
+    )
     safe_row = tl.minimum(tl.maximum(row_index, 0), tl.maximum(buffer_rows - 1, 0))
     vals = tl.load(
         buffer_ptr + safe_row[:, None] * buffer_stride_row + offsets_d[None, :] * buffer_stride_d,
         mask=valid[:, None] & mask_d[None, :],
         other=0.0,
     )
-    out_k = offs_k + out_topk_offset
     tl.store(
         out_ptr + q * out_stride_q + out_k[:, None] * out_stride_k + offsets_d[None, :] * out_stride_d,
         vals,
-        mask=(offs_k[:, None] < (out_topk_offset + total_topk)) & mask_d[None, :],
+        mask=out_valid[:, None] & mask_d[None, :],
     )
     tl.store(
         invalid_ptr + q * invalid_stride_q + out_k * invalid_stride_k,
         ~valid,
-        mask=(block_d == 0) & (offs_k < total_topk),
+        mask=(block_d == 0) & out_valid,
     )
 
 
@@ -257,15 +282,24 @@ def _launch_gather(
 ) -> None:
     q_tokens = out.shape[0]
     idx_rows = indices.shape[0]
+    idx_topk = indices.shape[1]
+    lengths_rows = lengths.shape[0]
+    out_topk_capacity = out.shape[1]
     head_dim = buffer.shape[-1]
     if q_tokens == 0 or total_topk == 0:
+        return
+    if out_topk_offset < 0 or out_topk_offset >= out_topk_capacity:
+        return
+    writable_topk = out_topk_capacity - out_topk_offset
+    effective_topk = min(total_topk, idx_topk, writable_topk)
+    if effective_topk <= 0:
         return
     flat = buffer.view(-1, head_dim)
     buffer_rows = flat.shape[0]
     block_d = min(1024, triton.next_power_of_2(max(1, head_dim)))
     # Larger K tiles reduce launch overhead on narrower head dimensions.
     block_k = 16 if head_dim <= 256 else 8
-    grid = (q_tokens, triton.cdiv(total_topk, block_k), triton.cdiv(head_dim, block_d))
+    grid = (q_tokens, triton.cdiv(effective_topk, block_k), triton.cdiv(head_dim, block_d))
     _gather_bf16_kv_kernel[grid](
         flat,
         indices,
@@ -273,9 +307,12 @@ def _launch_gather(
         out,
         invalid_mask,
         idx_rows,
+        idx_topk,
+        lengths_rows,
         buffer_rows,
         q_tokens,
-        total_topk,
+        out_topk_capacity,
+        effective_topk,
         head_dim,
         indices.stride(0),
         indices.stride(1),
@@ -300,11 +337,14 @@ def gather_bf16_kv(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if buffer.device.type != "cuda":
         return gather_bf16_kv_torch(buffer, indices, lengths, total_topk)
-    indices = indices[:, :total_topk]
     q_tokens = indices.shape[0]
     head_dim = buffer.shape[-1]
     out = torch.empty((q_tokens, total_topk, head_dim), dtype=buffer.dtype, device=buffer.device)
     invalid_mask = torch.empty((q_tokens, total_topk), dtype=torch.bool, device=buffer.device)
+    if indices.shape[1] < total_topk:
+        out[:, indices.shape[1] : total_topk].zero_()
+        invalid_mask[:, indices.shape[1] : total_topk].fill_(True)
+    indices = indices[:, :total_topk]
     _launch_gather(buffer, indices, lengths, out, invalid_mask, total_topk)
     return out, invalid_mask
 
@@ -318,14 +358,25 @@ def gather_bf16_kv_into(
     invalid_mask: torch.Tensor,
     out_topk_offset: int = 0,
 ) -> None:
+    if out_topk_offset < 0:
+        return
+    out_topk_end = min(out.shape[1], out_topk_offset + total_topk)
+    writable_topk = max(0, out_topk_end - out_topk_offset)
     if buffer.device.type != "cuda":
         gathered, invalid = gather_bf16_kv_torch(buffer, indices, lengths, total_topk)
         rows = min(out.shape[0], gathered.shape[0])
-        out[:, out_topk_offset : out_topk_offset + total_topk].zero_()
-        invalid_mask[:, out_topk_offset : out_topk_offset + total_topk].fill_(True)
-        out[:rows, out_topk_offset : out_topk_offset + total_topk].copy_(gathered[:rows])
-        invalid_mask[:rows, out_topk_offset : out_topk_offset + total_topk].copy_(invalid[:rows])
+        out[:, out_topk_offset:out_topk_end].zero_()
+        invalid_mask[:, out_topk_offset:out_topk_end].fill_(True)
+        out[:rows, out_topk_offset:out_topk_end].copy_(gathered[:rows, :writable_topk])
+        invalid_mask[:rows, out_topk_offset:out_topk_end].copy_(invalid[:rows, :writable_topk])
         return
+    if writable_topk <= 0:
+        return
+    available_topk = min(indices.shape[1], total_topk, writable_topk)
+    if available_topk < writable_topk:
+        tail_start = out_topk_offset + available_topk
+        out[:, tail_start:out_topk_end].zero_()
+        invalid_mask[:, tail_start:out_topk_end].fill_(True)
     _launch_gather(
         buffer,
         indices[:, :total_topk],
