@@ -911,7 +911,12 @@ def _prepare_sparse_metadata(
 
 def _patch_deepseek_v4_backend() -> None:
     from sglang.srt.layers.attention import deepseek_v4_backend as dsv4_backend
-    from triton_kernels import gather_bf16_kv_into
+    from triton_kernels import (
+        direct_dual_sparse_attention,
+        direct_sparse_attention,
+        gather_bf16_kv_into,
+        gather_bf16_kv_torch,
+    )
 
     original_forward = dsv4_backend.DeepseekV4AttnBackend.forward
     _pad_tensor_to_size = dsv4_backend._pad_tensor_to_size
@@ -1041,32 +1046,72 @@ def _patch_deepseek_v4_backend() -> None:
                     extra_buf = extra_buf.squeeze(2)
                     total_topk = swa_topk + extra_idx.shape[-1]
 
+            qk_head_dim = q3.shape[-1]
+            q_head_num = q3.shape[1]
+            if _env_enabled("SGLANG_DSV4_A100_DIRECT_ATTENTION", "1"):
+                with _record_function("dsv4_bf16_attention_direct_triton"):
+                    if extra_idx is None:
+                        out, _lse = direct_sparse_attention(
+                            q3.contiguous(),
+                            swa_buf,
+                            swa_idx,
+                            swa_len,
+                            self.softmax_scale,
+                            attn_sink=attn_sink,
+                        )
+                    else:
+                        out, _lse = direct_dual_sparse_attention(
+                            q3.contiguous(),
+                            swa_buf,
+                            swa_idx,
+                            swa_len,
+                            extra_buf,
+                            extra_idx,
+                            extra_len,
+                            self.softmax_scale,
+                            attn_sink=attn_sink,
+                        )
+                return out
+
             with _record_function("dsv4_bf16_attention_gather_triton"):
                 gathered, invalid_mask = _get_reusable_sparse_buffers(
                     self, q_tokens, total_topk, head_dim, q3.device
                 )
-                gather_bf16_kv_into(
-                    swa_buf,
-                    swa_idx,
-                    swa_len,
-                    swa_topk,
-                    gathered,
-                    invalid_mask,
-                    0,
-                )
-                if extra_idx is not None:
+                if _env_enabled("SGLANG_DSV4_A100_TORCH_GATHER", "0"):
+                    with _record_function("dsv4_bf16_attention_gather_torch"):
+                        swa_gathered, swa_invalid = gather_bf16_kv_torch(
+                            swa_buf, swa_idx, swa_len, swa_topk
+                        )
+                        gathered[:, :swa_topk].copy_(swa_gathered)
+                        invalid_mask[:, :swa_topk].copy_(swa_invalid)
+                        if extra_idx is not None:
+                            extra_topk = extra_idx.shape[-1]
+                            extra_gathered, extra_invalid = gather_bf16_kv_torch(
+                                extra_buf, extra_idx, extra_len, extra_topk
+                            )
+                            gathered[:, swa_topk:total_topk].copy_(extra_gathered)
+                            invalid_mask[:, swa_topk:total_topk].copy_(extra_invalid)
+                else:
                     gather_bf16_kv_into(
-                        extra_buf,
-                        extra_idx,
-                        extra_len,
-                        extra_idx.shape[-1],
+                        swa_buf,
+                        swa_idx,
+                        swa_len,
+                        swa_topk,
                         gathered,
                         invalid_mask,
-                        swa_topk,
+                        0,
                     )
+                    if extra_idx is not None:
+                        gather_bf16_kv_into(
+                            extra_buf,
+                            extra_idx,
+                            extra_len,
+                            extra_idx.shape[-1],
+                            gathered,
+                            invalid_mask,
+                            swa_topk,
+                        )
 
-            qk_head_dim = q3.shape[-1]
-            q_head_num = q3.shape[1]
             with _record_function("dsv4_bf16_attention_run_unified_attention"):
                 out, _lse = run_unified_attention(
                     q3.contiguous(),
