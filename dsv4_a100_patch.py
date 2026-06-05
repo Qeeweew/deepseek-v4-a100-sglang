@@ -705,6 +705,7 @@ def _patch_dsv4_core_compressor_bf16_store() -> None:
         compressor_prefill_metadata,
         compressor_positions_from_plan,
     )
+    from sglang.jit_kernel.hadamard import hadamard_transform
 
     original_forward_unified = compressor_v2.CompressorBackendMixin.forward_unified
     is_overlap_compress = compressor_v2.is_overlap_compress
@@ -862,6 +863,11 @@ def _patch_dsv4_core_compressor_bf16_store() -> None:
             )
             if kv_compressed.shape[0] == 0:
                 return
+            if compressor.rotate:
+                with _record_function("compressor_indexer_hadamard_rotate"):
+                    kv_compressed = hadamard_transform(
+                        kv_compressed, scale=compressor.head_dim**-0.5
+                    )
             out_loc_to_store = _compressed_out_loc(
                 self.forward_metadata.core_metadata.c4_out_loc, plan
             )
