@@ -376,37 +376,30 @@ def _patch_deepseek_v4_bf16_kv_pool() -> None:
 
 
 def _patch_dsv4_mxfp4_moe_a100() -> None:
-    from torch.nn import Module, Parameter
+    from torch.nn import Module
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization import mxfp4_marlin_moe
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        with _record_function("mxfp4_moe_prepare_triton_a100"):
+        with _record_function("mxfp4_moe_prepare_ogs_a100"):
             self._fp8.process_weights_after_loading(layer)
             if getattr(layer, "_mega_moe_weights_built", False):
-                return
+                raise RuntimeError(
+                    "DeepSeek V4 MXFP4 A100 matmul_ogs path does not support "
+                    "prebuilt MegaMoE weights; no fallback is allowed."
+                )
 
             layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
             layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
 
-            for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
-                scale = getattr(layer, scale_name)
-                if scale.dtype == torch.float32:
-                    continue
-                scale_data = scale.data
-                if scale_data.dtype == torch.float8_e8m0fnu:
-                    scale_data = scale_data.to(torch.float32)
-                elif scale_data.dtype in (torch.uint8, torch.int8):
-                    scale_data = scale_data.view(torch.uint8).view(torch.float8_e8m0fnu).to(torch.float32)
-                else:
-                    scale_data = scale_data.float()
-                setattr(layer, scale_name, Parameter(scale_data, requires_grad=False))
+            from triton_kernels import prepare_mxfp4_moe_ogs
 
-            layer._dsv4_mxfp4_backend = "a100_triton"
+            prepare_mxfp4_moe_ogs(layer)
+            layer._dsv4_mxfp4_backend = "a100_ogs"
             logger.warning(
-                "Monkey patch: using Triton MXFP4 MoE fallback for %s.",
+                "Monkey patch: using matmul_ogs MXFP4 MoE for %s.",
                 self.prefix,
             )
 
@@ -415,44 +408,45 @@ def _patch_dsv4_mxfp4_moe_a100() -> None:
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
-        if getattr(layer, "_dsv4_mxfp4_backend", None) == "a100_triton":
-            from sglang.srt.layers.moe.fused_moe_triton.mxfp4_moe_sm120_triton import (
-                mxfp4_moe_forward_triton,
-            )
-
+        if getattr(layer, "_dsv4_mxfp4_backend", None) == "a100_ogs":
             hidden_states = dispatch_output.hidden_states
             w13 = layer.w13_weight.data
-            w2 = layer.w2_weight.data
-            w13_scale = layer.w13_weight_scale_inv.data
-            w2_scale = layer.w2_weight_scale_inv.data
             intermediate_size = w13.shape[1] // 2
             hidden_size = w13.shape[2] * 2
 
-            with _record_function("mxfp4_moe_forward_triton_a100"):
-                output = mxfp4_moe_forward_triton(
+            routed_scaling_factor = (
+                self.runner.config.routed_scaling_factor
+                if hasattr(self.runner, "config")
+                else None
+            )
+            clamp_limit = (
+                self.runner.config.swiglu_limit if hasattr(self.runner, "config") else None
+            )
+            apply_router_weight_on_input = (
+                self.runner.config.apply_router_weight_on_input
+                if hasattr(self.runner, "config")
+                else False
+            )
+            from triton_kernels import mxfp4_moe_forward_ogs
+
+            with _record_function("mxfp4_moe_forward_ogs_a100"):
+                output = mxfp4_moe_forward_ogs(
                     hidden_states=hidden_states,
-                    w13_packed=w13,
-                    w2_packed=w2,
-                    w13_scale=w13_scale,
-                    w2_scale=w2_scale,
+                    weights=layer._dsv4_mxfp4_ogs_weights,
                     topk_ids=topk_output.topk_ids,
                     topk_weights=topk_output.topk_weights,
                     hidden_size=hidden_size,
                     intermediate_size=intermediate_size,
-                    routed_scaling_factor=(
-                        self.runner.config.routed_scaling_factor
-                        if hasattr(self.runner, "config")
-                        else None
-                    ),
-                    clamp_limit=(
-                        self.runner.config.swiglu_limit
-                        if hasattr(self.runner, "config")
-                        else None
-                    ),
+                    routed_scaling_factor=routed_scaling_factor,
+                    clamp_limit=clamp_limit,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
                 )
             return StandardCombineInput(hidden_states=output)
 
-        return self._sglang_original_apply(layer, dispatch_output)
+        raise RuntimeError(
+            "DeepSeek V4 MXFP4 A100 MoE was not prepared for matmul_ogs; "
+            "refusing to fall back to the slow/unsupported path."
+        )
 
     if not hasattr(
         mxfp4_marlin_moe.Mxfp4MarlinMoEMethod, "_sglang_original_apply"

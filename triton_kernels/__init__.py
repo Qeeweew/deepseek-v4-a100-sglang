@@ -1,3 +1,16 @@
+import sys
+from pathlib import Path
+
+for _path in sys.path:
+    _candidate = Path(_path) / "triton_kernels"
+    if (
+        _candidate.is_dir()
+        and _candidate != Path(__file__).resolve().parent
+        and (_candidate / "matmul_ogs.py").exists()
+    ):
+        __path__.append(str(_candidate))
+        break
+
 from .attention import direct_dual_sparse_attention, direct_sparse_attention
 from .elementwise import (
     compressor_decode_mask_positions,
@@ -24,6 +37,7 @@ from .kv_ops import (
     trim_and_pad_rows,
     trim_and_pad_rows_torch,
 )
+from .mxfp4_moe_ogs import mxfp4_moe_forward_ogs, prepare_mxfp4_moe_ogs
 
 __all__ = [
     "bf16_paged_mqa_logits",
@@ -43,6 +57,8 @@ __all__ = [
     "gather_bf16_kv",
     "gather_bf16_kv_into",
     "gather_bf16_kv_torch",
+    "mxfp4_moe_forward_ogs",
+    "prepare_mxfp4_moe_ogs",
     "scatter_bf16_rows",
     "scatter_bf16_rows_torch",
     "trim_and_pad_rows",

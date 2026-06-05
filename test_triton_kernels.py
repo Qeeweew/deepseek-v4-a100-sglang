@@ -21,6 +21,8 @@ from triton_kernels import (
     gather_bf16_kv,
     gather_bf16_kv_into,
     gather_bf16_kv_torch,
+    mxfp4_moe_forward_ogs,
+    prepare_mxfp4_moe_ogs,
     scatter_bf16_rows,
     scatter_bf16_rows_torch,
     trim_and_pad_rows,
@@ -115,6 +117,90 @@ def test_fused_rope_inplace_accuracy_and_perf():
     )
     assert torch_graph_ms > 0
     assert triton_graph_ms > 0
+
+
+def test_mxfp4_moe_ogs_smoke_keeps_e8m0_scales():
+    torch.manual_seed(21)
+
+    class Layer(torch.nn.Module):
+        pass
+
+    experts, tokens, hidden, intermediate, topk = 4, 4, 128, 64, 3
+    layer = Layer().cuda()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.randint(
+            0,
+            256,
+            (experts, 2 * intermediate, hidden // 2),
+            device="cuda",
+            dtype=torch.uint8,
+        ),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.randint(
+            0,
+            256,
+            (experts, hidden, intermediate // 2),
+            device="cuda",
+            dtype=torch.uint8,
+        ),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale_inv = torch.nn.Parameter(
+        torch.randint(
+            120,
+            128,
+            (experts, 2 * intermediate, hidden // 32),
+            device="cuda",
+            dtype=torch.uint8,
+        ),
+        requires_grad=False,
+    )
+    layer.w2_weight_scale_inv = torch.nn.Parameter(
+        torch.randint(
+            120,
+            128,
+            (experts, hidden, intermediate // 32),
+            device="cuda",
+            dtype=torch.uint8,
+        ),
+        requires_grad=False,
+    )
+
+    prepare_mxfp4_moe_ogs(layer)
+    assert layer.w13_weight_scale_inv.dtype == torch.uint8
+    assert layer.w2_weight_scale_inv.dtype == torch.uint8
+    assert layer.w13_weight_scale_inv.format_ue8m0
+    assert layer.w2_weight_scale_inv.format_ue8m0
+
+    hidden_states = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    topk_ids = torch.tensor(
+        [[0, 1, 2], [1, 2, 3], [2, 3, 0], [0, 3, 1]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    topk_weights = torch.full(
+        (tokens, topk), 1.0 / topk, device="cuda", dtype=torch.float32
+    )
+    from triton_kernels.mxfp4_moe_ogs import _make_routing_data
+
+    routing_data, _, _ = _make_routing_data(topk_ids, topk_weights, experts)
+    assert routing_data.n_expts_act == topk
+
+    out = mxfp4_moe_forward_ogs(
+        hidden_states,
+        layer._dsv4_mxfp4_ogs_weights,
+        topk_ids,
+        topk_weights,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == (tokens, hidden)
+    assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out).all()
 
 
 def test_scatter_bf16_rows_accuracy_and_perf():

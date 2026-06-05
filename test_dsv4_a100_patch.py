@@ -28,9 +28,10 @@ def test_patch_imports_and_rope_symbol():
     assert elementwise.fused_rope_inplace is model.fused_rope_inplace
 
 
-def test_patch_sets_mxfp4_moe_triton_fallback():
+def test_patch_sets_mxfp4_moe_ogs_path():
     apply_patch()
     from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
+    from triton_kernels import mxfp4_moe_forward_ogs, prepare_mxfp4_moe_ogs
 
     assert Mxfp4MarlinMoEMethod.apply.__module__ == "dsv4_a100_patch"
     assert (
@@ -38,6 +39,8 @@ def test_patch_sets_mxfp4_moe_triton_fallback():
         == "dsv4_a100_patch"
     )
     assert hasattr(Mxfp4MarlinMoEMethod, "_sglang_original_apply")
+    assert prepare_mxfp4_moe_ogs.__module__ == "triton_kernels.mxfp4_moe_ogs"
+    assert mxfp4_moe_forward_ogs.__module__ == "triton_kernels.mxfp4_moe_ogs"
 
 
 def test_patch_deepseek_v4_defaults_sets_marlin():
