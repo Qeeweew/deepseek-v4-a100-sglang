@@ -192,7 +192,7 @@ def _bf16_paged_mqa_logits_kernel(
             + offs_d[:, None] * q_stride_d,
             mask=mask_h[None, :] & mask_d[:, None],
             other=0.0,
-        ).to(tl.float32)
+        )
         k_vals = tl.load(
             k_ptr
             + safe_page_ids[:, None] * k_stride_page
@@ -201,7 +201,7 @@ def _bf16_paged_mqa_logits_kernel(
             mask=valid_page[:, None] & mask_d[None, :],
             other=0.0,
         )
-        acc += tl.dot(k_vals.to(tl.float32), q_vals, input_precision="tf32")
+        acc += tl.dot(k_vals, q_vals, input_precision="tf32")
 
     acc = tl.where(acc > 0.0, acc, 0.0)
     weights = tl.load(
@@ -244,15 +244,16 @@ def bf16_paged_mqa_logits(
         )
 
     out = torch.empty((batch_size, max_seq_len), dtype=torch.float32, device=q.device)
-    block_l = 16
-    block_d = 32
+    block_l = 256
+    block_d = 64
     block_h = triton.next_power_of_2(num_heads)
+    seq_lens_arg = seq_lens.to(torch.int32) if seq_lens.dtype not in (torch.int32, torch.int64) else seq_lens
     grid = (batch_size, triton.cdiv(max_seq_len, block_l))
     _bf16_paged_mqa_logits_kernel[grid](
         q,
         kvcache_bf16,
         weight,
-        seq_lens.to(torch.int32) if seq_lens.dtype not in (torch.int32, torch.int64) else seq_lens,
+        seq_lens_arg,
         page_table,
         out,
         int(max_seq_len),
@@ -274,6 +275,8 @@ def bf16_paged_mqa_logits(
         BLOCK_L=block_l,
         BLOCK_D=block_d,
         BLOCK_H=block_h,
+        num_warps=4,
+        num_stages=3,
     )
     return out
 
