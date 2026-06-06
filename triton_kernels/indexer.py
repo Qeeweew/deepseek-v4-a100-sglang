@@ -131,7 +131,7 @@ def bf16_paged_mqa_logits_torch(
     logits = logits[:, :max_seq_len].contiguous()
 
     pos = torch.arange(max_seq_len, device=logits.device).unsqueeze(0)
-    logits = logits.masked_fill(pos >= seq_lens.to(torch.long).unsqueeze(1), 0.0)
+    logits = logits.masked_fill(pos >= seq_lens.to(torch.long).unsqueeze(1), float("-inf"))
     return logits
 
 
@@ -162,58 +162,79 @@ def _bf16_paged_mqa_logits_kernel(
     BLOCK_L: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    NUM_WORKERS: tl.constexpr,
+    NUM_BLOCK_ITERS: tl.constexpr,
 ):
     b = tl.program_id(0)
-    block_l = tl.program_id(1)
-    offs_l = block_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    worker = tl.program_id(1)
     seq_len = tl.load(seq_lens_ptr + b).to(tl.int64)
-    valid_l = (offs_l < max_seq_len) & (offs_l < seq_len)
-
-    page_offsets = offs_l // 64
-    slot_offsets = offs_l - page_offsets * 64
-    page_ids = tl.load(
-        page_table_ptr + b * page_table_stride_b + page_offsets * page_table_stride_p,
-        mask=valid_l,
-        other=0,
-    ).to(tl.int64)
-    valid_page = valid_l & (page_ids >= 0) & (page_ids < k_pages)
-    safe_page_ids = tl.minimum(tl.maximum(page_ids, 0), tl.maximum(k_pages - 1, 0))
-
-    acc = tl.zeros((BLOCK_L, BLOCK_H), dtype=tl.float32)
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < num_heads
-    for d_start in range(0, head_dim, BLOCK_D):
-        offs_d = d_start + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < head_dim
-        q_vals = tl.load(
-            q_ptr
-            + b * q_stride_b
-            + offs_h[None, :] * q_stride_h
-            + offs_d[:, None] * q_stride_d,
-            mask=mask_h[None, :] & mask_d[:, None],
-            other=0.0,
-        )
-        k_vals = tl.load(
-            k_ptr
-            + safe_page_ids[:, None] * k_stride_page
-            + slot_offsets[:, None] * k_stride_block
-            + offs_d[None, :] * k_stride_d,
-            mask=valid_page[:, None] & mask_d[None, :],
-            other=0.0,
-        )
-        acc += tl.dot(k_vals, q_vals, input_precision="tf32")
 
-    acc = tl.where(acc > 0.0, acc, 0.0)
-    weights = tl.load(
-        weight_ptr + b * weight_stride_b + offs_h * weight_stride_h,
-        mask=mask_h,
-        other=0.0,
-    ).to(tl.float32)
-    logits = tl.sum(acc * weights[None, :], axis=1)
-    logits = tl.where(valid_l, logits, 0.0)
-    tl.store(out_ptr + b * out_stride_b + offs_l * out_stride_l, logits, mask=offs_l < max_seq_len)
+    for block_iter in range(0, NUM_BLOCK_ITERS):
+        block_l = worker + block_iter * NUM_WORKERS
+        tile_start = block_l * BLOCK_L
+        if tile_start < max_seq_len:
+            if tile_start < seq_len:
+                offs_l = tile_start + tl.arange(0, BLOCK_L)
+                valid_l = (offs_l < max_seq_len) & (offs_l < seq_len)
 
+                page_offsets = offs_l // 64
+                slot_offsets = offs_l - page_offsets * 64
+                page_ids = tl.load(
+                    page_table_ptr
+                    + b * page_table_stride_b
+                    + page_offsets * page_table_stride_p,
+                    mask=valid_l,
+                    other=0,
+                ).to(tl.int64)
+                valid_page = valid_l & (page_ids >= 0) & (page_ids < k_pages)
+                safe_page_ids = tl.minimum(
+                    tl.maximum(page_ids, 0), tl.maximum(k_pages - 1, 0)
+                )
 
+                acc = tl.zeros((BLOCK_L, BLOCK_H), dtype=tl.float32)
+                for d_start in range(0, head_dim, BLOCK_D):
+                    offs_d = d_start + tl.arange(0, BLOCK_D)
+                    mask_d = offs_d < head_dim
+                    q_vals = tl.load(
+                        q_ptr
+                        + b * q_stride_b
+                        + offs_h[None, :] * q_stride_h
+                        + offs_d[:, None] * q_stride_d,
+                        mask=mask_h[None, :] & mask_d[:, None],
+                        other=0.0,
+                    )
+                    k_vals = tl.load(
+                        k_ptr
+                        + safe_page_ids[:, None] * k_stride_page
+                        + slot_offsets[:, None] * k_stride_block
+                        + offs_d[None, :] * k_stride_d,
+                        mask=valid_page[:, None] & mask_d[None, :],
+                        other=0.0,
+                    )
+                    acc += tl.dot(k_vals, q_vals, input_precision="tf32")
+
+                acc = tl.where(acc > 0.0, acc, 0.0)
+                weights = tl.load(
+                    weight_ptr + b * weight_stride_b + offs_h * weight_stride_h,
+                    mask=mask_h,
+                    other=0.0,
+                ).to(tl.float32)
+                logits = tl.sum(acc * weights[None, :], axis=1)
+                logits = tl.where(valid_l, logits, float("-inf"))
+                tl.store(
+                    out_ptr + b * out_stride_b + offs_l * out_stride_l,
+                    logits,
+                    mask=offs_l < max_seq_len,
+                )
+            else:
+                offs_l = tile_start + tl.arange(0, BLOCK_L)
+                tl.store(
+                    out_ptr + b * out_stride_b + offs_l * out_stride_l,
+                    tl.full((BLOCK_L,), float("-inf"), dtype=tl.float32),
+                    mask=offs_l < max_seq_len,
+                )
 def bf16_paged_mqa_logits(
     q: torch.Tensor,
     kvcache_bf16: torch.Tensor,
@@ -243,12 +264,16 @@ def bf16_paged_mqa_logits(
             q, kvcache_bf16, weight, seq_lens, page_table, deep_gemm_metadata, max_seq_len, clean_logits
         )
 
-    out = torch.empty((batch_size, max_seq_len), dtype=torch.float32, device=q.device)
     block_l = 256
     block_d = 64
     block_h = triton.next_power_of_2(num_heads)
+    num_seq_blocks = triton.cdiv(max_seq_len, block_l)
+    num_workers = min(128, triton.next_power_of_2(max(1, num_seq_blocks)))
+    num_block_iters = triton.cdiv(num_seq_blocks, num_workers)
+
+    out = torch.empty((batch_size, max_seq_len), dtype=torch.float32, device=q.device)
     seq_lens_arg = seq_lens.to(torch.int32) if seq_lens.dtype not in (torch.int32, torch.int64) else seq_lens
-    grid = (batch_size, triton.cdiv(max_seq_len, block_l))
+    grid = (batch_size, num_workers)
     _bf16_paged_mqa_logits_kernel[grid](
         q,
         kvcache_bf16,
@@ -275,6 +300,8 @@ def bf16_paged_mqa_logits(
         BLOCK_L=block_l,
         BLOCK_D=block_d,
         BLOCK_H=block_h,
+        NUM_WORKERS=num_workers,
+        NUM_BLOCK_ITERS=num_block_iters,
         num_warps=4,
         num_stages=3,
     )
