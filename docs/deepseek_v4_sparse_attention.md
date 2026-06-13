@@ -289,64 +289,7 @@ source 循环。
 
 ## Split-K Variant
 
-可选 split-K 路径由两个 kernel 组成：
-
-```text
-_direct_dual_sparse_attention_splitk_kernel
-_direct_dual_sparse_attention_combine_kernel
-```
-
-split-K kernel 的 grid：
-
-$$
-\text{grid} =
-\left(
-\left\lceil \frac{H_q}{\text{BLOCK\_H}} \right\rceil,
-T,
-\text{split\_k}
-\right)
-$$
-
-每个 split 只处理 sparse topk 的一个区间，并写出 partial result：
-
-$$
-\text{PartialOutput}
-\in \mathbb{R}^{S \times T \times H_q \times D_v}
-$$
-
-$$
-\text{PartialLSE}
-\in \mathbb{R}^{S \times T \times H_q}
-$$
-
-combine kernel 使用 log-sum-exp rescale 合并 partial results。设第 $s$ 个
-split 的 partial LSE 是 $\ell_s$，则：
-
-$$
-m = \max_s \ell_s
-$$
-
-$$
-w_s = \exp(\ell_s - m)
-$$
-
-$$
-O =
-\frac{\sum_s w_s O_s}
-{\sum_s w_s}
-$$
-
-如果有 attention sink，则分母再加入 sink 项。
-
-环境变量：
-
-```text
-SGLANG_DSV4_A100_DUAL_SPLITK=1
-```
-
-会强制走 split-K。否则由 `_should_use_dual_splitk` 按 shape 选择。当前 A100
-TP8 常见形状 $H_q=64$ 下，heuristic 默认不使用 split-K，因为 decode 和
-prefill 单测都显示 non-splitK 更快。
+Split-K attention has been removed from the A100 monkeypatch. The dual-source direct attention path now always uses the single-kernel implementation.
 
 ## CUDA Graph 约束
 
@@ -410,8 +353,6 @@ overhead。
 ```text
 _direct_sparse_attention_kernel
 _direct_dual_sparse_attention_kernel
-_direct_dual_sparse_attention_splitk_kernel
-_direct_dual_sparse_attention_combine_kernel
 ```
 
 公开 Python wrapper 保持：

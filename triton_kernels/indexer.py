@@ -32,6 +32,7 @@ def _apply_rotary_tail_kernel(
     stride_x_dim,
     stride_freq_pos,
     stride_freq_dim,
+    num_freqs: tl.constexpr,
     head_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK_PAIRS: tl.constexpr,
@@ -44,6 +45,7 @@ def _apply_rotary_tail_kernel(
     mask = pair_offsets < (rope_dim // 2)
     base_dim = head_dim - rope_dim
     pos = tl.load(positions_ptr + pid_b).to(tl.int64)
+    pos = tl.minimum(tl.maximum(pos, 0), num_freqs - 1)
     base = pid_b * stride_x_batch + pid_h * stride_x_head
 
     offs_even = base + (base_dim + pair_offsets * 2) * stride_x_dim
@@ -80,6 +82,12 @@ def apply_rotary_tail_inplace(
         else _freqs_real(freqs_cis_or_real)
     )
     rope_dim = freqs.shape[1]
+    if rope_dim == 0:
+        return x
+    if rope_dim % 2 != 0 or rope_dim > x.shape[-1]:
+        raise ValueError(f"invalid rotary dim {rope_dim} for q dim {x.shape[-1]}")
+    if freqs.shape[0] <= 0:
+        raise ValueError("freqs must contain at least one position")
     block_pairs = min(64, triton.next_power_of_2(max(1, rope_dim // 2)))
     grid = (x.shape[0], x.shape[1], triton.cdiv(rope_dim // 2, block_pairs))
     _apply_rotary_tail_kernel[grid](
@@ -91,6 +99,7 @@ def apply_rotary_tail_inplace(
         x.stride(2),
         freqs.stride(0),
         freqs.stride(1),
+        freqs.shape[0],
         head_dim=x.shape[-1],
         rope_dim=rope_dim,
         BLOCK_PAIRS=block_pairs,
@@ -328,7 +337,7 @@ def bf16_indexer_q_torch(
         scratch_q.copy_(q_input)
         q = scratch_q
     else:
-        q = q_input.contiguous().to(torch.bfloat16)
+        q = q_input.to(torch.bfloat16).contiguous().clone()
     apply_rotary_tail_inplace(q, freqs_real if freqs_real is not None else freqs_cis, positions)
     if q_out is None:
         q = hadamard_transform(q, scale=q.shape[-1] ** -0.5)
@@ -390,7 +399,7 @@ def bf16_indexer_q(
         scratch_q.copy_(q_input)
         q = scratch_q
     else:
-        q = q_input.contiguous().to(torch.bfloat16)
+        q = q_input.to(torch.bfloat16).contiguous().clone()
     apply_rotary_tail_inplace(q, freqs_real if freqs_real is not None else freqs_cis, positions)
     if q_out is None:
         q = hadamard_transform(q, scale=q.shape[-1] ** -0.5)

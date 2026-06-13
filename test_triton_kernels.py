@@ -81,6 +81,87 @@ def _pack_plan(seq_lens, ragged_ids=None):
     return plan_i32.view(torch.uint8)
 
 
+def _apply_rotary_tail_reference(x, freqs_cis_or_real, positions):
+    freqs = (
+        torch.view_as_real(freqs_cis_or_real).flatten(-2)
+        if freqs_cis_or_real.is_complex()
+        else freqs_cis_or_real
+    )
+    rope_dim = freqs.shape[-1]
+    if rope_dim == 0:
+        return x
+    if rope_dim % 2 != 0 or rope_dim > x.shape[-1]:
+        raise ValueError(f"invalid rotary dim {rope_dim} for q dim {x.shape[-1]}")
+
+    pos = positions.to(torch.long).clamp(0, freqs.shape[0] - 1)
+    freq = freqs.index_select(0, pos).to(torch.float32)
+    base_dim = x.shape[-1] - rope_dim
+    tail = x[..., base_dim:].to(torch.float32).reshape(
+        x.shape[0], x.shape[1], rope_dim // 2, 2
+    )
+    freq = freq.reshape(x.shape[0], 1, rope_dim // 2, 2)
+    even = tail[..., 0]
+    odd = tail[..., 1]
+    freq_even = freq[..., 0]
+    freq_odd = freq[..., 1]
+    rotated = torch.stack(
+        (even * freq_even - odd * freq_odd, even * freq_odd + odd * freq_even),
+        dim=-1,
+    ).reshape(x.shape[0], x.shape[1], rope_dim)
+    x[..., base_dim:] = rotated.to(x.dtype)
+    return x
+
+
+def _hadamard_reference(x, scale):
+    if x.shape[-1] & (x.shape[-1] - 1):
+        raise ValueError(f"hadamard dim must be a power of 2, got {x.shape[-1]}")
+    y = x.to(torch.float32).clone()
+    pack = 4
+    if y.shape[-1] % pack != 0:
+        raise ValueError(f"packed hadamard dim must be divisible by {pack}")
+    data = y.reshape(-1, y.shape[-1] // pack, pack)
+
+    a0 = data[:, :, 0].clone()
+    a1 = data[:, :, 1].clone()
+    a2 = data[:, :, 2].clone()
+    a3 = data[:, :, 3].clone()
+    data[:, :, 0] = a0 + a1
+    data[:, :, 1] = a0 - a1
+    data[:, :, 2] = a2 + a3
+    data[:, :, 3] = a2 - a3
+
+    a0 = data[:, :, 0].clone()
+    a1 = data[:, :, 1].clone()
+    a2 = data[:, :, 2].clone()
+    a3 = data[:, :, 3].clone()
+    data[:, :, 0] = a0 + a2
+    data[:, :, 1] = a1 + a3
+    data[:, :, 2] = a0 - a2
+    data[:, :, 3] = a1 - a3
+
+    lanes = data.shape[1]
+    mask = 1
+    while mask < lanes:
+        old = data.clone()
+        for lane in range(lanes):
+            other = old[:, lane ^ mask, :]
+            if lane & mask:
+                data[:, lane, :] = other - old[:, lane, :]
+            else:
+                data[:, lane, :] = old[:, lane, :] + other
+        mask <<= 1
+
+    return (y.reshape_as(x) * scale).to(torch.bfloat16)
+
+
+def _bf16_indexer_q_reference(q_input, weight, weight_scale, freqs_cis_or_real, positions):
+    q = q_input.to(torch.bfloat16).contiguous().clone()
+    _apply_rotary_tail_reference(q, freqs_cis_or_real, positions)
+    q = _hadamard_reference(q, q.shape[-1] ** -0.5)
+    weights = (weight.float() * float(weight_scale)).unsqueeze(-1)
+    return q, weights
+
+
 def test_fused_rope_inplace_accuracy_and_perf():
     torch.manual_seed(1)
     device = "cuda"
@@ -332,6 +413,34 @@ def test_gather_bf16_kv_into_clamps_to_output_capacity():
     assert not mask_into[:, :out_topk_offset].any()
 
 
+def test_gather_bf16_kv_into_large_prefill_extra_shape():
+    torch.manual_seed(303)
+    device = "cuda"
+    q_tokens, swa_topk, extra_topk, head_dim = 8192, 128, 512, 512
+    buffer = torch.randn(7948, 64, head_dim, device=device, dtype=torch.bfloat16)
+    flat_rows = buffer.numel() // head_dim
+    indices = torch.randint(-1, 2112, (q_tokens, extra_topk), device=device, dtype=torch.int32)
+    lengths = torch.randint(1, extra_topk + 1, (q_tokens,), device=device, dtype=torch.int32)
+    out = torch.empty((q_tokens, swa_topk + extra_topk, head_dim), device=device, dtype=torch.bfloat16)
+    invalid = torch.empty((q_tokens, swa_topk + extra_topk), device=device, dtype=torch.bool)
+    out[:, :swa_topk].zero_()
+    invalid[:, :swa_topk].fill_(True)
+
+    gather_bf16_kv_into(buffer, indices, lengths, extra_topk, out, invalid, swa_topk)
+    torch.cuda.synchronize()
+
+    check_rows = torch.tensor([0, 1, 127, 4095, 8191], device=device, dtype=torch.long)
+    out_ref, mask_ref = gather_bf16_kv_torch(
+        buffer,
+        indices.index_select(0, check_rows),
+        lengths.index_select(0, check_rows),
+        extra_topk,
+    )
+    assert int(indices.max().item()) < flat_rows
+    torch.testing.assert_close(out.index_select(0, check_rows)[:, swa_topk:], out_ref, atol=0, rtol=0)
+    torch.testing.assert_close(invalid.index_select(0, check_rows)[:, swa_topk:], mask_ref, atol=0, rtol=0)
+
+
 def test_trim_and_pad_rows_accuracy():
     torch.manual_seed(31)
     device = "cuda"
@@ -413,6 +522,37 @@ def test_direct_sparse_attention_128_matches_gather_plus_unified():
     buffer = torch.randn(2048, head_dim, device=device, dtype=torch.bfloat16)
     indices = torch.randint(-1, buffer.shape[0], (q_tokens, topk), device=device, dtype=torch.int32)
     lengths = torch.randint(1, topk + 1, (q_tokens,), device=device, dtype=torch.int32)
+    attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
+    gathered, invalid = gather_bf16_kv(buffer, indices, lengths, topk)
+
+    from dsv4_a100_patch import _TRITON_COMMON
+
+    ref, _ = _TRITON_COMMON.run_unified_attention(
+        q.contiguous(),
+        gathered.contiguous(),
+        invalid.contiguous(),
+        head_dim,
+        head_dim**-0.5,
+        q_tokens,
+        heads,
+        topk,
+        head_dim,
+        attn_sink=attn_sink,
+    )
+    out, _ = direct_sparse_attention(q, buffer, indices, lengths, head_dim**-0.5, attn_sink=attn_sink)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("head_dim", [192, 320])
+def test_direct_sparse_attention_non_128_aligned_dims(head_dim):
+    torch.manual_seed(142 + head_dim)
+    device = "cuda"
+    q_tokens, heads, topk = 5, 11, 33
+    q = torch.randn(q_tokens, heads, head_dim, device=device, dtype=torch.bfloat16)
+    buffer = torch.randn(513, head_dim, device=device, dtype=torch.bfloat16)
+    indices = torch.randint(-1, buffer.shape[0], (q_tokens, topk), device=device, dtype=torch.int32)
+    lengths = torch.randint(0, topk + 1, (q_tokens,), device=device, dtype=torch.int32)
     attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
     gathered, invalid = gather_bf16_kv(buffer, indices, lengths, topk)
 
@@ -544,6 +684,46 @@ def test_direct_dual_sparse_attention_128_matches_gather_plus_unified():
     idx1 = torch.randint(-1, buf1.shape[0], (q_tokens, topk1), device=device, dtype=torch.int32)
     len0 = torch.randint(1, topk0 + 1, (q_tokens,), device=device, dtype=torch.int32)
     len1 = torch.randint(1, topk1 + 1, (q_tokens,), device=device, dtype=torch.int32)
+    attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
+    gathered0, invalid0 = gather_bf16_kv(buf0, idx0, len0, topk0)
+    gathered1, invalid1 = gather_bf16_kv(buf1, idx1, len1, topk1)
+    gathered = torch.cat([gathered0, gathered1], dim=1)
+    invalid = torch.cat([invalid0, invalid1], dim=1)
+
+    from dsv4_a100_patch import _TRITON_COMMON
+
+    ref, _ = _TRITON_COMMON.run_unified_attention(
+        q.contiguous(),
+        gathered.contiguous(),
+        invalid.contiguous(),
+        head_dim,
+        head_dim**-0.5,
+        q_tokens,
+        heads,
+        topk0 + topk1,
+        head_dim,
+        attn_sink=attn_sink,
+    )
+    out, _ = direct_dual_sparse_attention(
+        q, buf0, idx0, len0, buf1, idx1, len1, head_dim**-0.5, attn_sink=attn_sink
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("head_dim", [192, 320])
+def test_direct_dual_sparse_attention_non_128_aligned_dims(head_dim):
+    torch.manual_seed(143 + head_dim)
+    device = "cuda"
+    q_tokens, heads = 5, 11
+    topk0, topk1 = 37, 29
+    q = torch.randn(q_tokens, heads, head_dim, device=device, dtype=torch.bfloat16)
+    buf0 = torch.randn(1027, head_dim, device=device, dtype=torch.bfloat16)
+    buf1 = torch.randn(509, head_dim, device=device, dtype=torch.bfloat16)
+    idx0 = torch.randint(-1, buf0.shape[0], (q_tokens, topk0), device=device, dtype=torch.int32)
+    idx1 = torch.randint(-1, buf1.shape[0], (q_tokens, topk1), device=device, dtype=torch.int32)
+    len0 = torch.randint(0, topk0 + 1, (q_tokens,), device=device, dtype=torch.int32)
+    len1 = torch.randint(0, topk1 + 1, (q_tokens,), device=device, dtype=torch.int32)
     attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
     gathered0, invalid0 = gather_bf16_kv(buf0, idx0, len0, topk0)
     gathered1, invalid1 = gather_bf16_kv(buf1, idx1, len1, topk1)
@@ -720,115 +900,6 @@ def test_direct_dual_sparse_attention_runtime_tracks_sparse_lengths():
     assert short_ms * 1.2 < full_ms
 
 
-def test_direct_dual_sparse_attention_splitk_matches_gather_plus_unified(monkeypatch):
-    monkeypatch.setenv("SGLANG_DSV4_A100_DUAL_SPLITK", "1")
-    torch.manual_seed(236)
-    device = "cuda"
-    q_tokens, heads, head_dim = 32, 64, 512
-    topk0, topk1 = 512, 512
-    q = torch.randn(q_tokens, heads, head_dim, device=device, dtype=torch.bfloat16)
-    buf0 = torch.randn(65536, head_dim, device=device, dtype=torch.bfloat16)
-    buf1 = torch.randn(65536, head_dim, device=device, dtype=torch.bfloat16)
-    idx0 = torch.randint(-1, buf0.shape[0], (q_tokens, topk0), device=device, dtype=torch.int32)
-    idx1 = torch.randint(-1, buf1.shape[0], (q_tokens, topk1), device=device, dtype=torch.int32)
-    len0 = torch.randint(1, topk0 + 1, (q_tokens,), device=device, dtype=torch.int32)
-    len1 = torch.randint(1, topk1 + 1, (q_tokens,), device=device, dtype=torch.int32)
-    attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
-
-    gathered0, invalid0 = gather_bf16_kv(buf0, idx0, len0, topk0)
-    gathered1, invalid1 = gather_bf16_kv(buf1, idx1, len1, topk1)
-    gathered = torch.cat([gathered0, gathered1], dim=1)
-    invalid = torch.cat([invalid0, invalid1], dim=1)
-
-    from dsv4_a100_patch import _TRITON_COMMON
-
-    ref, _ = _TRITON_COMMON.run_unified_attention(
-        q.contiguous(),
-        gathered.contiguous(),
-        invalid.contiguous(),
-        head_dim,
-        head_dim**-0.5,
-        q_tokens,
-        heads,
-        topk0 + topk1,
-        head_dim,
-        attn_sink=attn_sink,
-    )
-    out, _ = direct_dual_sparse_attention(
-        q, buf0, idx0, len0, buf1, idx1, len1, head_dim**-0.5, attn_sink=attn_sink
-    )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
-
-
-def test_direct_dual_sparse_attention_splitk_cuda_graph_replay_length_growth(monkeypatch):
-    monkeypatch.setenv("SGLANG_DSV4_A100_DUAL_SPLITK", "1")
-    torch.manual_seed(237)
-    device = "cuda"
-    q_tokens, heads, head_dim = 32, 64, 512
-    topk0, topk1 = 512, 512
-    q = torch.randn(q_tokens, heads, head_dim, device=device, dtype=torch.bfloat16)
-    buf0 = torch.randn(65536, head_dim, device=device, dtype=torch.bfloat16)
-    buf1 = torch.randn(65536, head_dim, device=device, dtype=torch.bfloat16)
-    idx0 = torch.randint(0, buf0.shape[0], (q_tokens, topk0), device=device, dtype=torch.int32)
-    idx1 = torch.randint(0, buf1.shape[0], (q_tokens, topk1), device=device, dtype=torch.int32)
-    len0 = torch.full((q_tokens,), 128, device=device, dtype=torch.int32)
-    len1 = torch.full((q_tokens,), 0, device=device, dtype=torch.int32)
-    attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
-    out = torch.empty((q_tokens, heads, head_dim), dtype=torch.bfloat16, device=device)
-    lse = torch.empty((q_tokens, heads), dtype=torch.float32, device=device)
-
-    def run():
-        return direct_dual_sparse_attention(
-            q,
-            buf0,
-            idx0,
-            len0,
-            buf1,
-            idx1,
-            len1,
-            head_dim**-0.5,
-            attn_sink=attn_sink,
-            output=out,
-            lse=lse,
-        )
-
-    for _ in range(3):
-        run()
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    torch.cuda.synchronize()
-
-    len0.fill_(512)
-    len1.fill_(512)
-    graph.replay()
-    torch.cuda.synchronize()
-
-    gathered0, invalid0 = gather_bf16_kv(buf0, idx0, len0, topk0)
-    gathered1, invalid1 = gather_bf16_kv(buf1, idx1, len1, topk1)
-    gathered = torch.cat([gathered0, gathered1], dim=1)
-    invalid = torch.cat([invalid0, invalid1], dim=1)
-
-    from dsv4_a100_patch import _TRITON_COMMON
-
-    ref, _ = _TRITON_COMMON.run_unified_attention(
-        q.contiguous(),
-        gathered.contiguous(),
-        invalid.contiguous(),
-        head_dim,
-        head_dim**-0.5,
-        q_tokens,
-        heads,
-        topk0 + topk1,
-        head_dim,
-        attn_sink=attn_sink,
-    )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
-
 
 def test_bf16_paged_mqa_logits_accuracy_and_perf():
     torch.manual_seed(4)
@@ -949,7 +1020,7 @@ def test_bf16_indexer_q_accuracy_and_perf():
     positions = torch.randint(0, seqlen, (batch,), device=device, dtype=torch.int32)
     weight_scale = 0.125
 
-    q_ref, w_ref = bf16_indexer_q_torch(q.clone(), weight, weight_scale, freqs, positions)
+    q_ref, w_ref = _bf16_indexer_q_reference(q.clone(), weight, weight_scale, freqs, positions)
     q_tri, w_tri = bf16_indexer_q(q.clone(), weight, weight_scale, freqs, positions)
     torch.cuda.synchronize()
     torch.testing.assert_close(q_tri.float(), q_ref.float(), atol=3e-2, rtol=3e-2)
@@ -1001,6 +1072,151 @@ def test_bf16_indexer_q_accuracy_and_perf():
     torch.cuda.synchronize()
     torch.testing.assert_close(q_tri3.float(), q_ref.float(), atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(w_tri3.float(), w_ref.float(), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "batch,heads,head_dim,seqlen,position_dtype,use_freqs_real",
+    [
+        (1, 1, 128, 17, torch.int32, False),
+        (2, 3, 128, 129, torch.int64, True),
+        (8, 64, 128, 1024, torch.int32, True),
+        (31, 8, 128, 4096, torch.int64, False),
+        (256, 64, 128, 8192, torch.int32, True),
+    ],
+)
+def test_bf16_indexer_q_systematic_accuracy(
+    batch, heads, head_dim, seqlen, position_dtype, use_freqs_real
+):
+    torch.manual_seed(400 + batch + heads)
+    device = "cuda"
+    q = torch.randn(batch, heads, head_dim, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(batch, heads, device=device, dtype=torch.bfloat16)
+    freqs = torch.polar(
+        torch.ones((seqlen, head_dim // 4), device=device),
+        torch.randn((seqlen, head_dim // 4), device=device),
+    )
+    freqs_arg = torch.view_as_real(freqs).flatten(-2).contiguous() if use_freqs_real else freqs
+    base_positions = torch.randint(-4, seqlen + 4, (batch,), device=device, dtype=position_dtype)
+    edge_positions = torch.tensor(
+        [-3, -1, 0, 1, max(0, seqlen - 2), seqlen - 1, seqlen, seqlen + 3],
+        device=device,
+        dtype=position_dtype,
+    )
+    base_positions[: min(batch, edge_positions.numel())] = edge_positions[: min(batch, edge_positions.numel())]
+    weight_scale = 0.125
+
+    q_ref, w_ref = _bf16_indexer_q_reference(q, weight, weight_scale, freqs_arg, base_positions)
+    q_tri, w_tri = bf16_indexer_q(q, weight, weight_scale, freqs_arg, base_positions)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(q_tri.float(), q_ref.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(w_tri.float(), w_ref.float(), atol=1e-5, rtol=1e-5)
+
+
+def test_bf16_indexer_q_buffers_noncontiguous_and_inplace():
+    torch.manual_seed(41)
+    device = "cuda"
+    batch, heads, head_dim, seqlen = 7, 5, 128, 257
+    q_storage = torch.randn(heads, batch, head_dim, device=device, dtype=torch.bfloat16)
+    q = q_storage.transpose(0, 1)
+    assert not q.is_contiguous()
+    weight_storage = torch.randn(heads, batch, device=device, dtype=torch.bfloat16)
+    weight = weight_storage.transpose(0, 1)
+    assert not weight.is_contiguous()
+    freqs = torch.polar(
+        torch.ones((seqlen, head_dim // 4), device=device),
+        torch.randn((seqlen, head_dim // 4), device=device),
+    )
+    freqs_real = torch.view_as_real(freqs).flatten(-2).contiguous()
+    positions = torch.tensor([-1, 0, 1, 2, seqlen - 1, seqlen, seqlen + 1], device=device, dtype=torch.int64)
+    weight_scale = 0.25
+
+    q_ref, w_ref = _bf16_indexer_q_reference(q, weight, weight_scale, freqs_real, positions)
+    q_big = torch.empty(batch + 3, heads, head_dim, device=device, dtype=torch.bfloat16)
+    w_big = torch.empty(batch + 3, heads, 1, device=device, dtype=torch.float32)
+    scratch_q = torch.empty(batch, heads, head_dim, device=device, dtype=torch.bfloat16)
+    q_out = q_big[:batch]
+    weights_out = w_big[:batch]
+    q_tri, w_tri = bf16_indexer_q(
+        q,
+        weight,
+        weight_scale,
+        freqs,
+        positions,
+        q_out=q_out,
+        weights_out=weights_out,
+        scratch_q=scratch_q,
+        freqs_real=freqs_real,
+    )
+    torch.cuda.synchronize()
+    assert q_tri.data_ptr() == q_out.data_ptr()
+    assert w_tri.data_ptr() == weights_out.data_ptr()
+    torch.testing.assert_close(q_tri.float(), q_ref.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(w_tri.float(), w_ref.float(), atol=1e-5, rtol=1e-5)
+
+    q_inplace = q.contiguous()
+    q_tri2, w_tri2 = bf16_indexer_q(
+        q_inplace,
+        weight,
+        weight_scale,
+        freqs,
+        positions,
+        q_out=q_out,
+        weights_out=weights_out,
+        allow_inplace_input=True,
+        freqs_real=freqs_real,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(q_tri2.float(), q_ref.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(w_tri2.float(), w_ref.float(), atol=1e-5, rtol=1e-5)
+
+
+def test_bf16_indexer_q_cuda_graph_replay_position_and_weight_changes():
+    torch.manual_seed(42)
+    device = "cuda"
+    batch, heads, head_dim, seqlen = 16, 16, 128, 2048
+    q = torch.randn(batch, heads, head_dim, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(batch, heads, device=device, dtype=torch.bfloat16)
+    freqs = torch.polar(
+        torch.ones((seqlen, head_dim // 4), device=device),
+        torch.randn((seqlen, head_dim // 4), device=device),
+    )
+    freqs_real = torch.view_as_real(freqs).flatten(-2).contiguous()
+    positions = torch.randint(0, seqlen, (batch,), device=device, dtype=torch.int32)
+    q_out = torch.empty_like(q)
+    weights_out = torch.empty(batch, heads, 1, device=device, dtype=torch.float32)
+    weight_scale = 0.125
+
+    def run():
+        return bf16_indexer_q(
+            q,
+            weight,
+            weight_scale,
+            freqs,
+            positions,
+            q_out=q_out,
+            weights_out=weights_out,
+            allow_inplace_input=True,
+            freqs_real=freqs_real,
+        )
+
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    torch.cuda.synchronize()
+
+    q_new = torch.randn_like(q)
+    q.copy_(q_new)
+    weight.copy_(torch.randn_like(weight))
+    positions.copy_(torch.randint(-8, seqlen + 8, (batch,), device=device, dtype=torch.int32))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    q_ref, w_ref = _bf16_indexer_q_reference(q_new, weight, weight_scale, freqs_real, positions)
+    torch.testing.assert_close(q_out.float(), q_ref.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(weights_out.float(), w_ref.float(), atol=1e-5, rtol=1e-5)
 
 
 def test_compressor_decode_mask_positions_accuracy_and_perf():
@@ -1056,6 +1272,27 @@ def test_compressor_prefill_metadata_accuracy_and_perf():
     )
     assert torch_graph_ms > 0
     assert triton_graph_ms > 0
+
+
+def test_compressor_prefill_metadata_masks_out_of_range_ragged_ids():
+    torch.manual_seed(61)
+    device = "cuda"
+    rows, out_rows, ratio = 1024, 128, 128
+    seq_lens = torch.randint(1, 32768, (rows,), device=device, dtype=torch.int32)
+    ragged_ids = torch.randint(0, out_rows, (rows,), device=device, dtype=torch.int32)
+    ragged_ids[0] = out_rows
+    ragged_ids[1] = out_rows + 17
+    ragged_ids[2] = 65535
+    out_loc = torch.randint(0, 1 << 30, (out_rows,), device=device, dtype=torch.int64)
+    plan = _pack_plan(seq_lens, ragged_ids)
+
+    pos_tri, loc_tri = compressor_prefill_metadata(plan, out_loc, ratio)
+    torch.cuda.synchronize()
+
+    expected_pos = (seq_lens - ratio).clamp(min=0)
+    expected_ids = (ragged_ids & 0xFFFF).to(torch.long).clamp(0, out_rows - 1)
+    torch.testing.assert_close(pos_tri, expected_pos, atol=0, rtol=0)
+    torch.testing.assert_close(loc_tri, out_loc[expected_ids], atol=0, rtol=0)
 
 
 def test_compressor_positions_from_plan_accuracy_and_perf():

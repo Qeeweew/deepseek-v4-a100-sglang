@@ -232,6 +232,7 @@ def _gather_bf16_kv_kernel(
     q = tl.program_id(0)
     k_block = tl.program_id(1)
     block_d = tl.program_id(2)
+    q_u64 = q.to(tl.uint64)
     offs_k = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
     offsets_d = block_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_d = offsets_d < head_dim
@@ -239,12 +240,12 @@ def _gather_bf16_kv_kernel(
     idx_valid = (q < idx_rows) & (offs_k < idx_topk)
     out_valid = (q < out_rows) & (out_k < out_topk_capacity) & (offs_k < total_topk)
     q_len_valid = q < lengths_rows
-    length = tl.load(lengths_ptr + q, mask=q_len_valid, other=0).to(tl.int64)
+    length = tl.load(lengths_ptr + q, mask=q_len_valid, other=0)
     row_index = tl.load(
         indices_ptr + q * idx_stride_q + offs_k * idx_stride_k,
         mask=idx_valid & (offs_k < total_topk),
         other=-1,
-    ).to(tl.int64)
+    )
     valid = (
         idx_valid
         & q_len_valid
@@ -260,12 +261,15 @@ def _gather_bf16_kv_kernel(
         other=0.0,
     )
     tl.store(
-        out_ptr + q * out_stride_q + out_k[:, None] * out_stride_k + offsets_d[None, :] * out_stride_d,
+        out_ptr
+        + q_u64 * out_stride_q
+        + out_k[:, None] * out_stride_k
+        + offsets_d[None, :] * out_stride_d,
         vals,
         mask=out_valid[:, None] & mask_d[None, :],
     )
     tl.store(
-        invalid_ptr + q * invalid_stride_q + out_k * invalid_stride_k,
+        invalid_ptr + q_u64 * invalid_stride_q + out_k * invalid_stride_k,
         ~valid,
         mask=(block_d == 0) & out_valid,
     )

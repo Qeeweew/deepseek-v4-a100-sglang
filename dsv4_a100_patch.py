@@ -45,7 +45,11 @@ def _can_sync_cuda() -> bool:
 def _record_function(name: str):
     with torch.profiler.record_function(f"dsv4_a100_patch::{name}"):
         yield
-    if _env_enabled("SGLANG_DSV4_A100_DEBUG_SYNC", "0") and _can_sync_cuda():
+    sync = _env_enabled("SGLANG_DSV4_A100_DEBUG_SYNC", "0")
+    sync_names = os.environ.get("SGLANG_DSV4_A100_DEBUG_SYNC_NAMES", "").strip()
+    if sync_names:
+        sync = any(part and part in name for part in sync_names.split(","))
+    if sync and _can_sync_cuda():
         try:
             torch.cuda.synchronize()
         except Exception:
@@ -126,7 +130,7 @@ def _bf16_indexer_q_torch_fallback(
     if allow_inplace_input and q_input.dtype == torch.bfloat16 and q_input.is_contiguous():
         q = q_input
     else:
-        q = q_input.contiguous().to(torch.bfloat16)
+        q = q_input.to(torch.bfloat16).contiguous().clone()
     _apply_rotary_tail_torch(q, freqs_cis_or_real, positions)
     q = _hadamard_transform_torch(q, q_out)
     weights = (weight.float() * float(weight_scale)).unsqueeze(-1)
@@ -526,25 +530,27 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
         q_entry = q_cache.get(q_key)
         q_out = None if q_entry is None else q_entry["tensor"]
         if q_out is None or q_out.shape[0] < q.shape[0]:
+            retired = [] if q_entry is None else q_entry.setdefault("retired", [])
             if q_out is not None:
-                q_entry.setdefault("retired", []).append(q_out)
+                retired.append(q_out)
             q_out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
-            q_cache[q_key] = {"tensor": q_out, "retired": []}
+            q_cache[q_key] = {"tensor": q_out, "retired": retired}
         else:
             q_out = q_out[: q.shape[0]]
         w_entry = weight_cache.get(w_key)
         weights_out = None if w_entry is None else w_entry["tensor"]
         if weights_out is None or weights_out.shape[0] < w_shape[0]:
+            retired = [] if w_entry is None else w_entry.setdefault("retired", [])
             if weights_out is not None:
-                w_entry.setdefault("retired", []).append(weights_out)
+                retired.append(weights_out)
             weights_out = torch.empty(w_shape, device=weight.device, dtype=torch.float32)
-            weight_cache[w_key] = {"tensor": weights_out, "retired": []}
+            weight_cache[w_key] = {"tensor": weights_out, "retired": retired}
         else:
             weights_out = weights_out[: w_shape[0]]
         if freqs_real is None or freqs_real.device != self.freqs_cis.device:
             freqs_real = torch.view_as_real(self.freqs_cis).flatten(-2).contiguous()
             self._dsv4_bf16_indexer_freqs_real = freqs_real
-        if _env_enabled("SGLANG_DSV4_A100_TORCH_INDEXER_Q", "1"):
+        if _env_enabled("SGLANG_DSV4_A100_TORCH_INDEXER_Q", "0"):
             with _record_function("c4_bf16_indexer_q_torch_fallback"):
                 return _bf16_indexer_q_torch_fallback(
                     q,
@@ -977,6 +983,24 @@ def _patch_deepseek_v4_backend() -> None:
         }
         return output, lse
 
+    def _get_reusable_lse_buffer(
+        self,
+        q_tokens: int,
+        q_heads: int,
+        device: torch.device,
+    ):
+        cache = _get_tensor_cache(self, "_dsv4_attention_lse_buffers")
+        needed = (q_heads, _device_key(device))
+        cached = cache.get(needed)
+        if cached is not None and cached["lse"].shape[0] >= q_tokens:
+            return cached["lse"][:q_tokens]
+        retired = [] if cached is None else cached.setdefault("retired", [])
+        if cached is not None:
+            retired.append(cached["lse"])
+        lse = torch.empty((q_tokens, q_heads), dtype=torch.float32, device=device)
+        cache[needed] = {"lse": lse, "retired": retired}
+        return lse
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1050,18 +1074,23 @@ def _patch_deepseek_v4_backend() -> None:
             q_head_num = q3.shape[1]
             if _env_enabled("SGLANG_DSV4_A100_DIRECT_ATTENTION", "1"):
                 with _record_function("dsv4_bf16_attention_direct_triton"):
+                    lse_buf = _get_reusable_lse_buffer(
+                        self, q_tokens, q_head_num, q3.device
+                    )
+                    q3_contig = q3.contiguous()
                     if extra_idx is None:
                         out, _lse = direct_sparse_attention(
-                            q3.contiguous(),
+                            q3_contig,
                             swa_buf,
                             swa_idx,
                             swa_len,
                             self.softmax_scale,
                             attn_sink=attn_sink,
+                            lse=lse_buf,
                         )
                     else:
                         out, _lse = direct_dual_sparse_attention(
-                            q3.contiguous(),
+                            q3_contig,
                             swa_buf,
                             swa_idx,
                             swa_len,
@@ -1070,6 +1099,7 @@ def _patch_deepseek_v4_backend() -> None:
                             extra_len,
                             self.softmax_scale,
                             attn_sink=attn_sink,
+                            lse=lse_buf,
                         )
                 return out
 

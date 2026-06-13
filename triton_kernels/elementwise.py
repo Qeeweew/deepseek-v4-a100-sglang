@@ -254,7 +254,8 @@ def compressor_prefill_metadata_torch(
     seq_lens = _read_i32_from_plan_torch(plan_tensor, 0)
     ragged_ids = _read_i32_from_plan_torch(plan_tensor, 1) & 0xFFFF
     positions = (seq_lens.to(torch.int32) - int(compress_ratio)).clamp(min=0)
-    return positions, out_loc[ragged_ids.to(torch.long)]
+    ragged_ids = ragged_ids.to(torch.long).clamp(0, max(0, out_loc.numel() - 1))
+    return positions, out_loc[ragged_ids]
 
 
 @triton.jit
@@ -337,6 +338,7 @@ def _compressor_prefill_metadata_kernel(
     positions_ptr,
     selected_out_loc_ptr,
     rows: tl.constexpr,
+    out_loc_rows: tl.constexpr,
     plan_stride_row: tl.constexpr,
     compress_ratio: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -346,7 +348,8 @@ def _compressor_prefill_metadata_kernel(
     seq_len = _load_plan_i32(plan_ptr, offsets, plan_stride_row, 0, mask)
     ragged_id = _load_plan_i32(plan_ptr, offsets, plan_stride_row, 1, mask) & 0xFFFF
     positions = tl.maximum(seq_len - compress_ratio, 0)
-    selected = tl.load(out_loc_ptr + ragged_id, mask=mask, other=0)
+    safe_ragged = tl.minimum(tl.maximum(ragged_id, 0), tl.maximum(out_loc_rows - 1, 0))
+    selected = tl.load(out_loc_ptr + safe_ragged, mask=mask & (out_loc_rows > 0), other=0)
     tl.store(positions_ptr + offsets, positions, mask=mask)
     tl.store(selected_out_loc_ptr + offsets, selected, mask=mask)
 
@@ -361,7 +364,7 @@ def compressor_prefill_metadata(
     if plan_tensor.dtype == torch.int32:
         plan_i32 = _plan_tensor_as_i32(plan_tensor)
         positions = (plan_i32[:, 0] - int(compress_ratio)).clamp(min=0).to(torch.int32)
-        ragged_ids = (plan_i32[:, 1] & 0xFFFF).to(torch.long)
+        ragged_ids = (plan_i32[:, 1] & 0xFFFF).to(torch.long).clamp(0, max(0, out_loc.numel() - 1))
         return positions, out_loc[ragged_ids]
     if plan_tensor.dtype != torch.uint8:
         return compressor_prefill_metadata_torch(plan_tensor, out_loc, compress_ratio)
@@ -377,6 +380,7 @@ def compressor_prefill_metadata(
         positions,
         selected_out_loc,
         rows,
+        out_loc.numel(),
         plan_tensor.stride(0),
         int(compress_ratio),
         BLOCK=block,
