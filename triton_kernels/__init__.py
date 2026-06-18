@@ -38,6 +38,13 @@ from .kv_ops import (
     trim_and_pad_rows_torch,
 )
 from .mxfp4_moe_ogs import mxfp4_moe_forward_ogs, prepare_mxfp4_moe_ogs
+from .mxfp4_int8_moe import (
+    mxfp4_int8_dense_forward,
+    mxfp4_int8_moe_forward,
+    prepare_mxfp4_int8_dense_weight,
+    prepare_mxfp4_int8_moe,
+    remap_mxfp4_weight_for_int8,
+)
 
 __all__ = [
     "bf16_paged_mqa_logits",
@@ -58,7 +65,12 @@ __all__ = [
     "gather_bf16_kv_into",
     "gather_bf16_kv_torch",
     "mxfp4_moe_forward_ogs",
+    "mxfp4_int8_dense_forward",
+    "mxfp4_int8_moe_forward",
+    "prepare_mxfp4_int8_dense_weight",
     "prepare_mxfp4_moe_ogs",
+    "prepare_mxfp4_int8_moe",
+    "remap_mxfp4_weight_for_int8",
     "scatter_bf16_rows",
     "scatter_bf16_rows_torch",
     "trim_and_pad_rows",
