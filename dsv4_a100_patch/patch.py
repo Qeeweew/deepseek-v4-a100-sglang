@@ -14,7 +14,6 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger(__name__)
 _PATCH_APPLIED = False
-_MXFP4_INT8_FUNC_ATTRS_INITIALIZED: set[int] = set()
 
 
 def _env_enabled(name: str, default: str = "1") -> bool:
@@ -31,28 +30,6 @@ def _get_tensor_cache(obj, attr: str) -> dict:
         cache = {}
         setattr(obj, attr, cache)
     return cache
-
-
-def _init_mxfp4_int8_cuda_func_attributes_once(device: torch.device | None) -> None:
-    if device is None or device.type != "cuda":
-        return
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    if device_index in _MXFP4_INT8_FUNC_ATTRS_INITIALIZED:
-        return
-
-    import mxfp4_int8  # noqa: F401
-
-    with torch.cuda.device(device_index):
-        initialized = torch.ops.mxfp4_int8.init_cuda_func_attributes()
-    _MXFP4_INT8_FUNC_ATTRS_INITIALIZED.add(device_index)
-    logger.warning(
-        "Monkey patch: initialized mxfp4_int8 CUDA function attributes "
-        "for device %d (%d kernels).",
-        device_index,
-        initialized,
-    )
 
 
 def _can_sync_cuda() -> bool:
@@ -181,9 +158,29 @@ def _load_module(name: str, path: Path):
     return module
 
 
+def _resolve_sglang_source_file(relative_path: str) -> Path:
+    sglang_root = os.environ.get("SGLANG_ROOT")
+    candidates = []
+    if sglang_root:
+        candidates.append(Path(sglang_root) / "python" / "sglang" / relative_path)
+
+    spec = importlib.util.find_spec("sglang")
+    if spec is not None and spec.origin is not None:
+        candidates.append(Path(spec.origin).resolve().parent / relative_path)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"Cannot locate SGLang source file {relative_path!r}; set SGLANG_ROOT"
+    )
+
+
 _TRITON_COMMON = _load_module(
     "dsv4_triton_decode_common",
-    Path("/workspace/sglang/python/sglang/srt/layers/attention/nsa/triton_decode/triton_mla_kernels_decode_common.py"),
+    _resolve_sglang_source_file(
+        "srt/layers/attention/nsa/triton_decode/triton_mla_kernels_decode_common.py"
+    ),
 )
 def apply_patch() -> None:
     global _PATCH_APPLIED
@@ -280,7 +277,7 @@ def _patch_dsv4_pool_configurator() -> None:
 def _patch_deepseek_v4_bf16_kv_pool() -> None:
     from sglang.srt.mem_cache import deepseek_v4_memory_pool as dsv4_pool
     from sglang.srt.models import deepseek_v4 as deepseek_v4_model
-    from triton_kernels import scatter_bf16_rows
+    from dsv4_a100_patch.triton_kernels import scatter_bf16_rows
 
     original_single_kv_pool = dsv4_pool.DeepSeekV4SingleKVPool
     original_indexer_pool = dsv4_pool.DeepSeekV4IndexerPool
@@ -431,9 +428,8 @@ def _patch_dsv4_mxfp4_moe_a100() -> None:
             layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
 
             if moe_backend in {"mxfp4_int8", "int8", "cutlass"}:
-                from triton_kernels import prepare_mxfp4_int8_moe
+                from dsv4_a100_patch.triton_kernels import prepare_mxfp4_int8_moe
 
-                _init_mxfp4_int8_cuda_func_attributes_once(layer.w13_weight.device)
                 headroom_bits = int(os.environ.get("SGLANG_DSV4_MXFP4_INT8_HEADROOM_BITS", "3"))
                 topk = (
                     int(self.runner.config.num_experts_per_tok)
@@ -449,7 +445,7 @@ def _patch_dsv4_mxfp4_moe_a100() -> None:
                     headroom_bits,
                 )
             elif moe_backend == "ogs":
-                from triton_kernels import prepare_mxfp4_moe_ogs
+                from dsv4_a100_patch.triton_kernels import prepare_mxfp4_moe_ogs
 
                 prepare_mxfp4_moe_ogs(layer)
                 layer._dsv4_mxfp4_backend = "a100_ogs"
@@ -498,7 +494,7 @@ def _patch_dsv4_mxfp4_moe_a100() -> None:
             )
 
             if backend == "a100_mxfp4_int8":
-                from triton_kernels import mxfp4_int8_moe_forward
+                from dsv4_a100_patch.triton_kernels import mxfp4_int8_moe_forward
 
                 with _record_function("mxfp4_int8_moe_forward_a100"):
                     output = mxfp4_int8_moe_forward(
@@ -513,7 +509,7 @@ def _patch_dsv4_mxfp4_moe_a100() -> None:
                         apply_router_weight_on_input=apply_router_weight_on_input,
                     )
             else:
-                from triton_kernels import mxfp4_moe_forward_ogs
+                from dsv4_a100_patch.triton_kernels import mxfp4_moe_forward_ogs
 
                 with _record_function("mxfp4_moe_forward_ogs_a100"):
                     output = mxfp4_moe_forward_ogs(
@@ -549,7 +545,7 @@ def _patch_dsv4_mxfp4_moe_a100() -> None:
 def _patch_fused_rope_inplace() -> None:
     import sglang.jit_kernel.dsv4.elementwise as dsv4_elementwise
     import sglang.srt.models.deepseek_v4 as dsv4_model
-    from triton_kernels import fused_rope_inplace as triton_fused_rope_inplace
+    from dsv4_a100_patch.triton_kernels import fused_rope_inplace as triton_fused_rope_inplace
 
     def fused_rope_inplace(
         q: torch.Tensor,
@@ -570,7 +566,7 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
     import sglang.srt.layers.attention.dsv4.indexer as dsv4_indexer
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
     from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-    from triton_kernels import bf16_indexer_q, bf16_paged_mqa_logits
+    from dsv4_a100_patch.triton_kernels import bf16_indexer_q, bf16_paged_mqa_logits
 
     def bf16_paged_mqa_logits_torch(
         q: torch.Tensor,
@@ -787,7 +783,7 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
 
 
 def _extract_compressor_positions(plan, compress_ratio: int) -> torch.Tensor:
-    from triton_kernels import compressor_positions_from_plan
+    from dsv4_a100_patch.triton_kernels import compressor_positions_from_plan
 
     return compressor_positions_from_plan(plan[1].view(torch.int32).reshape(plan[1].shape[0], 4), compress_ratio)
 
@@ -796,7 +792,7 @@ def _patch_dsv4_core_compressor_bf16_store() -> None:
     import sglang.srt.layers.attention.dsv4.compressor_v2 as compressor_v2
     from sglang.jit_kernel.dsv4 import compress_forward
     from sglang.srt.layers.deepseek_v4_rope import fused_norm_rope_inplace_triton
-    from triton_kernels import (
+    from dsv4_a100_patch.triton_kernels import (
         compressor_decode_mask_positions,
         compressor_prefill_metadata,
         compressor_positions_from_plan,
@@ -984,7 +980,7 @@ def _trim_rows(page_indices: torch.Tensor, lengths: torch.Tensor, q_tokens: int)
 
 
 def _gather_bf16_kv(buffer: torch.Tensor, indices: torch.Tensor, lengths: torch.Tensor, total_topk: int):
-    from triton_kernels import gather_bf16_kv
+    from dsv4_a100_patch.triton_kernels import gather_bf16_kv
 
     with _record_function("gather_bf16_kv"):
         return gather_bf16_kv(buffer, indices, lengths, total_topk)
@@ -1007,7 +1003,7 @@ def _prepare_sparse_metadata(
 
 def _patch_deepseek_v4_backend() -> None:
     from sglang.srt.layers.attention import deepseek_v4_backend as dsv4_backend
-    from triton_kernels import (
+    from dsv4_a100_patch.triton_kernels import (
         direct_dual_sparse_attention,
         direct_sparse_attention,
         gather_bf16_kv_into,

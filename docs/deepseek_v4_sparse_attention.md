@@ -1,6 +1,6 @@
 # DeepSeek V4 Sparse Attention Kernel 设计说明
 
-本文档说明 `/workspace/monkeypatch/triton_kernels/attention.py` 中 A100
+本文档说明 `dsv4_a100_patch/triton_kernels/attention.py` 中 A100
 BF16 sparse attention kernel 的设计。这里的 kernel 使用 mode-neutral 命名，
 不再使用 `decode` 命名，因为同一个 attention kernel 同时服务 decode 和
 prefill/extend。两者的区别在 metadata 生成方式，而不是 sparse attention

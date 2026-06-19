@@ -7,7 +7,7 @@ import torch
 
 from sglang.jit_kernel.utils import cache_once, make_cpp_args
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang_jit_patches.jit_loader import load_patch_jit
+from dsv4_a100_patch.sglang_jit_patches.jit_loader import load_patch_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -113,12 +113,17 @@ def prewarm_mxfp4_int8_moe_jit_modules(
     topk: int,
     block_ms: tuple[int, ...] = (16, 32, 64),
     block_n: int | None = None,
+    tile_shapes: tuple[tuple[int, int], ...] | None = None,
 ) -> None:
     """Compile and initialize MoE JIT modules before CUDA graph capture."""
     device_index = torch.cuda.current_device()
     _cuda_sm_count(device_index)
-    for block_m in block_ms:
-        resolved_block_n = _default_block_n(block_m) if block_n is None else block_n
+    if tile_shapes is None:
+        tile_shapes = tuple(
+            (block_m, _default_block_n(block_m) if block_n is None else block_n)
+            for block_m in block_ms
+        )
+    for block_m, resolved_block_n in tile_shapes:
         for source_rows_are_slots in (False, True):
             _jit_mxfp4_int8_moe_module(
                 hidden_size,

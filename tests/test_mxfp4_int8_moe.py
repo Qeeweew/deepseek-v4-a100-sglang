@@ -9,6 +9,7 @@ from triton_kernels.mxfp4_int8_moe import (
     mxfp4_int8_moe_forward,
     prepare_mxfp4_int8_dense_weight,
     prepare_mxfp4_int8_moe,
+    quantize_per_token_int8,
     remap_mxfp4_weight_for_int8,
 )
 
@@ -134,6 +135,20 @@ def test_triton_repack_matches_torch_repack_bitwise():
     torch.testing.assert_close(tri[2], ref[2], atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_triton_quantize_per_token_matches_extension(dtype):
+    _ensure_extension_loaded()
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(20260622)
+    a = torch.randn((17, 129), device="cuda", dtype=dtype, generator=gen) * 0.5
+    a[0].zero_()
+    tri_q, tri_scale = quantize_per_token_int8(a, 0.0)
+    ref_q, ref_scale = torch.ops.mxfp4_int8.quantize_per_token(a.contiguous(), 0.0)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(tri_q, ref_q, atol=0, rtol=0)
+    torch.testing.assert_close(tri_scale, ref_scale, atol=0, rtol=0)
+
+
 def test_mxfp4_int8_dense_matches_original_mxfp4_reference():
     n, k, m = 128, 128, 11
     weight, scale = _make_random_packed_mxfp4(1, n, k, seed=20260619)
@@ -170,7 +185,9 @@ def test_mxfp4_int8_moe_jit_matches_torch_extension_grouped_gemm():
         topk_ids, block_m, experts
     )
 
-    from sglang.jit_kernel.mxfp4_int8_moe import mxfp4_int8_moe_gemm
+    from dsv4_a100_patch.sglang_jit_patches.mxfp4_int8_moe import (
+        mxfp4_int8_moe_gemm,
+    )
 
     hidden_states = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.2
     a13_q, a13_scale = torch.ops.mxfp4_int8.quantize_per_token(hidden_states, 0.0)

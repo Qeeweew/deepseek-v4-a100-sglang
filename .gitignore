@@ -3,3 +3,12 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+build/
+dist/
+*.egg-info/
+*.so
+*.log
+*.pid
+*_results.jsonl
+bench_*_logs/
+benchmark_results*/

@@ -33,14 +33,20 @@ def test_patch_sets_mxfp4_moe_ogs_path():
     from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
     from triton_kernels import mxfp4_moe_forward_ogs, prepare_mxfp4_moe_ogs
 
-    assert Mxfp4MarlinMoEMethod.apply.__module__ == "dsv4_a100_patch"
+    assert Mxfp4MarlinMoEMethod.apply.__module__ == "dsv4_a100_patch.patch"
     assert (
         Mxfp4MarlinMoEMethod.process_weights_after_loading.__module__
-        == "dsv4_a100_patch"
+        == "dsv4_a100_patch.patch"
     )
     assert hasattr(Mxfp4MarlinMoEMethod, "_sglang_original_apply")
-    assert prepare_mxfp4_moe_ogs.__module__ == "triton_kernels.mxfp4_moe_ogs"
-    assert mxfp4_moe_forward_ogs.__module__ == "triton_kernels.mxfp4_moe_ogs"
+    assert (
+        prepare_mxfp4_moe_ogs.__module__
+        == "dsv4_a100_patch.triton_kernels.mxfp4_moe_ogs"
+    )
+    assert (
+        mxfp4_moe_forward_ogs.__module__
+        == "dsv4_a100_patch.triton_kernels.mxfp4_moe_ogs"
+    )
 
 
 def test_patch_deepseek_v4_defaults_sets_marlin():
@@ -142,7 +148,7 @@ def test_indexer_bf16_torch_fallback_values():
     ref = (torch.relu(scores) * weight.squeeze(-1)[:, None, :].float()).sum(dim=-1)
     ref = ref[:, :max_seq_len].contiguous()
     pos = torch.arange(max_seq_len, device="cuda").unsqueeze(0)
-    ref = ref.masked_fill(pos >= seq_lens.squeeze(-1).long().unsqueeze(1), 0.0)
+    ref = ref.masked_fill(pos >= seq_lens.squeeze(-1).long().unsqueeze(1), float("-inf"))
     torch.testing.assert_close(logits, ref, rtol=1e-5, atol=1e-5)
 
 

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepseek-v4-a100"
+version = "0.1.0"
+description = "A100 runtime patch and MXFP4/INT4 model tooling for DeepSeek V4 on SGLang."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = [
+  "torch",
+  "triton",
+  "safetensors",
+]
+
+[project.optional-dependencies]
+int4-conversion = [
+  "compressed-tensors",
+  "llmcompressor",
+]
+
+[tool.setuptools]
+py-modules = ["sitecustomize"]
+packages = [
+  "dsv4_a100_patch",
+  "dsv4_a100_patch.triton_kernels",
+  "dsv4_a100_patch.sglang_jit_patches",
+  "triton_kernels",
+]
+
+[tool.setuptools.package-data]
+"dsv4_a100_patch.sglang_jit_patches" = ["csrc/gemm/mxfp4_int8/*.cuh"]

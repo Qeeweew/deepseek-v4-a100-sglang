@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 import triton
@@ -13,10 +11,6 @@ from torch.nn import Parameter
 
 logger = logging.getLogger(__name__)
 
-_EXPERIMENT_ROOT = Path("/workspace/experiments/mxfp4_int8_design")
-if str(_EXPERIMENT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_EXPERIMENT_ROOT))
-
 
 _E2M1_MAG_X2 = torch.tensor([0, 1, 2, 3, 4, 6, 8, 12], dtype=torch.float32)
 _E2M1_SIGNED_X2 = torch.tensor(
@@ -24,6 +18,16 @@ _E2M1_SIGNED_X2 = torch.tensor(
     dtype=torch.float32,
 )
 _MXFP4_INT8_MOE_JIT_AVAILABLE: bool | None = None
+_VALID_BLOCK_M = {16, 32, 64, 128}
+_VALID_BLOCK_N = {32, 64, 128}
+_DSV4_A100_MXFP4_INT8_TILE_TABLE: tuple[tuple[int, int, int], ...] = (
+    (1, 16, 128),
+    (8, 16, 64),
+    (1024, 16, 128),
+    (2048, 64, 128),
+    (1 << 30, 128, 128),
+)
+_MAX_BLOCK_M = 128
 
 
 @dataclass
@@ -49,6 +53,74 @@ def _ensure_extension_loaded() -> None:
     import mxfp4_int8  # noqa: F401
 
 
+@triton.jit
+def _quantize_per_token_kernel(
+    a,
+    a_q,
+    a_scale,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    clamp_abs: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    m = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_K)
+    mask = offs < K
+    values = tl.load(a + m * K + offs, mask=mask, other=0.0).to(tl.float32)
+    if clamp_abs > 0.0:
+        values = tl.minimum(tl.maximum(values, -clamp_abs), clamp_abs)
+    max_abs = tl.max(tl.abs(values), axis=0)
+    scale = max_abs / 127.0
+    scale = tl.where(scale == 0.0, 1.0, scale)
+    q_i32 = tl.inline_asm_elementwise(
+        "cvt.rni.s32.f32 $0, $1;",
+        "=r,f",
+        [values / scale],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    q_i32 = tl.minimum(tl.maximum(q_i32, -127), 127)
+    q = q_i32.to(tl.int8)
+    tl.store(a_q + m * K + offs, q, mask=mask)
+    tl.store(a_scale + m, scale, mask=m < M)
+
+
+def quantize_per_token_int8(
+    a: torch.Tensor,
+    clamp_abs: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if a.dim() != 2:
+        raise ValueError(f"a must have shape [M, K], got {tuple(a.shape)}")
+    if a.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise TypeError(f"a must be fp32, fp16, or bf16, got {a.dtype}")
+    if not a.is_cuda:
+        if clamp_abs > 0.0:
+            a_f = a.float().clamp(-float(clamp_abs), float(clamp_abs))
+        else:
+            a_f = a.float()
+        scale = a_f.abs().amax(dim=1) / 127.0
+        scale = torch.where(scale == 0.0, torch.ones_like(scale), scale).to(torch.float32)
+        q = torch.round(a_f / scale[:, None]).clamp(-127, 127).to(torch.int8)
+        return q.contiguous(), scale.contiguous()
+    a = a.contiguous()
+    m, k = a.shape
+    a_q = torch.empty_like(a, dtype=torch.int8)
+    a_scale = torch.empty((m,), device=a.device, dtype=torch.float32)
+    block_k = triton.next_power_of_2(k)
+    _quantize_per_token_kernel[(m,)](
+        a,
+        a_q,
+        a_scale,
+        m,
+        k,
+        float(clamp_abs),
+        BLOCK_K=block_k,
+        num_warps=8,
+    )
+    return a_q, a_scale
+
+
 def _mxfp4_int8_moe_jit_enabled() -> bool:
     env = os.environ.get("SGLANG_DSV4_MXFP4_INT8_USE_JIT", "1").strip().lower()
     return env not in {"0", "false", "no", "off"}
@@ -64,14 +136,38 @@ def _try_prewarm_mxfp4_int8_moe_jit(
     if _MXFP4_INT8_MOE_JIT_AVAILABLE is False:
         return
     try:
-        from sglang_jit_patches.mxfp4_int8_moe import (
+        from dsv4_a100_patch.sglang_jit_patches.mxfp4_int8_moe import (
             prewarm_mxfp4_int8_moe_jit_modules,
         )
 
+        tiles_env = os.environ.get("SGLANG_DSV4_MXFP4_INT8_JIT_PREWARM_TILES")
+        if tiles_env:
+            tile_shapes = tuple(_parse_tile_shape(item) for item in tiles_env.replace(";", ",").split(",") if item.strip())
+            prewarm_mxfp4_int8_moe_jit_modules(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                topk=topk,
+                tile_shapes=tile_shapes,
+            )
+            _MXFP4_INT8_MOE_JIT_AVAILABLE = True
+            return
+
         block_ms_env = os.environ.get("SGLANG_DSV4_MXFP4_INT8_JIT_PREWARM_BLOCK_M")
+        block_n_env = os.environ.get("SGLANG_DSV4_MXFP4_INT8_BLOCK_N")
         if block_ms_env is None:
             selected_block_m = os.environ.get("SGLANG_DSV4_MXFP4_INT8_BLOCK_M")
-            block_ms = (int(selected_block_m),) if selected_block_m else (16, 128)
+            if selected_block_m:
+                block_ms = (int(selected_block_m),)
+            else:
+                tile_shapes = tuple(sorted({(tile[1], tile[2]) for tile in _DSV4_A100_MXFP4_INT8_TILE_TABLE}))
+                prewarm_mxfp4_int8_moe_jit_modules(
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    topk=topk,
+                    tile_shapes=tile_shapes,
+                )
+                _MXFP4_INT8_MOE_JIT_AVAILABLE = True
+                return
         else:
             block_ms = tuple(
                 int(item) for item in block_ms_env.replace(";", ",").split(",") if item.strip()
@@ -81,6 +177,7 @@ def _try_prewarm_mxfp4_int8_moe_jit(
             intermediate_size=intermediate_size,
             topk=topk,
             block_ms=block_ms,
+            block_n=int(block_n_env) if block_n_env else None,
         )
         _MXFP4_INT8_MOE_JIT_AVAILABLE = True
     except Exception:
@@ -105,11 +202,12 @@ def _mxfp4_int8_moe_grouped_gemm_nt(
     num_valid_tokens: int,
     hidden_size: int,
     intermediate_size: int,
+    block_size_n: int,
 ) -> None:
     global _MXFP4_INT8_MOE_JIT_AVAILABLE
     if _mxfp4_int8_moe_jit_enabled() and _MXFP4_INT8_MOE_JIT_AVAILABLE is not False:
         try:
-            from sglang_jit_patches.mxfp4_int8_moe import mxfp4_int8_moe_gemm
+            from dsv4_a100_patch.sglang_jit_patches.mxfp4_int8_moe import mxfp4_int8_moe_gemm
 
             routed_out = None
             if mul_topk_weights:
@@ -133,6 +231,7 @@ def _mxfp4_int8_moe_grouped_gemm_nt(
                 intermediate_size=intermediate_size,
                 topk=topk,
                 block_m=block_size_m,
+                block_n=block_size_n,
                 source_rows_are_slots=mul_topk_weights,
                 num_valid_tokens=num_valid_tokens,
                 routed_out=routed_out,
@@ -143,6 +242,7 @@ def _mxfp4_int8_moe_grouped_gemm_nt(
             _MXFP4_INT8_MOE_JIT_AVAILABLE = False
             logger.exception("MXFP4-int8 MoE JIT launch failed; falling back to torch extension")
 
+    _ensure_extension_loaded()
     size_n = hidden_size if mul_topk_weights else intermediate_size * 2
     size_k = intermediate_size if mul_topk_weights else hidden_size
     torch.ops.mxfp4_int8.moe_grouped_gemm_nt(
@@ -617,7 +717,6 @@ def prepare_mxfp4_int8_moe(
     headroom_bits: int = 3,
     topk: int | None = None,
 ) -> None:
-    _ensure_extension_loaded()
     repack_backend = os.environ.get("SGLANG_DSV4_MXFP4_INT8_REPACK_BACKEND", "triton").strip().lower()
     if repack_backend not in {"triton", "torch"}:
         raise ValueError("SGLANG_DSV4_MXFP4_INT8_REPACK_BACKEND must be 'triton' or 'torch'")
@@ -661,16 +760,54 @@ def prepare_mxfp4_int8_moe(
 
 
 def _select_block_size_m(m: int, topk: int, experts: int) -> int:
-    env = os.environ.get("SGLANG_DSV4_MXFP4_INT8_BLOCK_M", "").strip()
-    if env:
-        block = int(env)
-        if block not in {16, 32, 64, 128}:
+    return _select_moe_tile_shape(m, topk, experts)[0]
+
+
+def select_mxfp4_int8_moe_tile_shape(m: int, topk: int, experts: int) -> tuple[int, int]:
+    return _select_moe_tile_shape(m, topk, experts)
+
+
+def max_mxfp4_int8_moe_block_m(m: int, topk: int, experts: int) -> int:
+    avg_tokens_per_expert = max(1, (m * topk + max(experts, 1) - 1) // max(experts, 1))
+    return min(_MAX_BLOCK_M, max(16, 1 << (avg_tokens_per_expert - 1).bit_length()))
+
+
+def _parse_tile_shape(text: str) -> tuple[int, int]:
+    parts = text.strip().lower().replace("x", ",").split(",")
+    if len(parts) != 2:
+        raise ValueError(f"invalid tile shape {text!r}, expected MxN")
+    block_m, block_n = int(parts[0]), int(parts[1])
+    if block_m not in _VALID_BLOCK_M:
+        raise ValueError("block_m must be 16, 32, 64, or 128")
+    if block_n not in _VALID_BLOCK_N:
+        raise ValueError("block_n must be 32, 64, or 128")
+    return block_m, block_n
+
+
+def _select_moe_tile_shape(m: int, topk: int, experts: int) -> tuple[int, int]:
+    max_block_m = max_mxfp4_int8_moe_block_m(m, topk, experts)
+    block_m_env = os.environ.get("SGLANG_DSV4_MXFP4_INT8_BLOCK_M", "").strip()
+    block_n_env = os.environ.get("SGLANG_DSV4_MXFP4_INT8_BLOCK_N", "").strip()
+    if block_m_env or block_n_env:
+        block_m = int(block_m_env) if block_m_env else 16
+        block_n = int(block_n_env) if block_n_env else 128
+        if block_m not in _VALID_BLOCK_M:
             raise ValueError("SGLANG_DSV4_MXFP4_INT8_BLOCK_M must be 16, 32, 64, or 128")
-        return block
-    for block in (16,):
-        if m * topk / max(experts, 1) / block < 0.9:
-            return block
-    return 128
+        if block_n not in _VALID_BLOCK_N:
+            raise ValueError("SGLANG_DSV4_MXFP4_INT8_BLOCK_N must be 32, 64, or 128")
+        if block_m > max_block_m:
+            raise ValueError(
+                f"SGLANG_DSV4_MXFP4_INT8_BLOCK_M={block_m} exceeds cap "
+                f"{max_block_m} for m={m}, topk={topk}, experts={experts}"
+            )
+        return block_m, block_n
+    for max_batch, block_m, block_n in _DSV4_A100_MXFP4_INT8_TILE_TABLE:
+        if m <= max_batch and block_m <= max_block_m:
+            return block_m, block_n
+    for _, block_m, block_n in reversed(_DSV4_A100_MXFP4_INT8_TILE_TABLE):
+        if block_m <= max_block_m:
+            return block_m, block_n
+    return 16, 128
 
 
 def _moe_align_block_size(
@@ -727,7 +864,6 @@ def mxfp4_int8_moe_forward(
         raise NotImplementedError(
             "mxfp4_int8 MoE only supports router weights in the W2 reduce path"
         )
-    _ensure_extension_loaded()
     if hidden_states.dtype != torch.bfloat16:
         hidden_states = hidden_states.to(torch.bfloat16)
     hidden_states = hidden_states.contiguous()
@@ -737,12 +873,12 @@ def mxfp4_int8_moe_forward(
     m = hidden_states.shape[0]
     topk = topk_ids_i32.shape[1]
     experts = weights.w13_mxfp4.shape[0]
-    block_size_m = _select_block_size_m(m, topk, experts)
+    block_size_m, block_size_n = _select_moe_tile_shape(m, topk, experts)
     sorted_token_ids, expert_ids, num_tokens_post_padded = _moe_align_block_size(
         topk_ids_i32, block_size_m, experts
     )
 
-    a13_q, a13_scale = torch.ops.mxfp4_int8.quantize_per_token(hidden_states, 0.0)
+    a13_q, a13_scale = quantize_per_token_int8(hidden_states, 0.0)
     gate_up = torch.empty(
         (m * topk, intermediate_size * 2),
         device=hidden_states.device,
@@ -765,9 +901,10 @@ def mxfp4_int8_moe_forward(
         m * topk,
         hidden_size,
         intermediate_size,
+        block_size_n,
     )
     intermediate = _apply_swiglu(gate_up, clamp_limit).contiguous()
-    a2_q, a2_scale = torch.ops.mxfp4_int8.quantize_per_token(intermediate, 0.0)
+    a2_q, a2_scale = quantize_per_token_int8(intermediate, 0.0)
     out = torch.empty((m, hidden_size), device=hidden_states.device, dtype=torch.bfloat16)
     _mxfp4_int8_moe_grouped_gemm_nt(
         a2_q,
@@ -786,6 +923,7 @@ def mxfp4_int8_moe_forward(
         m * topk,
         hidden_size,
         intermediate_size,
+        block_size_n,
     )
     if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
         out.mul_(routed_scaling_factor)
