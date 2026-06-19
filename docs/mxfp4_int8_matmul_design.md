@@ -122,12 +122,58 @@ else    -> 12
 ```
 
 符号位从原始 code 保留，原始 zero 仍映射为 zero。实验仓库中的统计脚本进一步
-说明，实际 routed expert 权重的 scale 通常比 64 倍上界集中得多：采样矩阵中 row
-span 的中位数约为 2，p90 约为 3，p99 约为 4.21，最差 sampled row span 为 5。
-因此 `headroom_bits=3` 在 sampled routed expert 权重上没有观察到 INT8 overflow，
-大部分非零权重可以精确保留。这是 DeepSeek V4 权重格式约束和实际 scale 分布共同
-作用的结果，不是任意 MXFP4 权重都自动成立。它仍然是近似格式，不应该描述为
-bit-exact MXFP4 dequant。
+说明，实际 routed expert 权重的 scale 通常比 64 倍上界集中得多。
+
+统计使用实验仓库脚本：
+
+```bash
+python /workspace/experiments/mxfp4_int8_design/scripts/analyze_mxfp4_weight_remap.py \
+  --headroom-bits 3 \
+  --output-dir /workspace/experiments/mxfp4_int8_design/results/headroom3
+```
+
+统计口径：
+
+- 模型：`/ssd1/models/DeepSeek-V4-Flash-MoE-MXFP4-BF16`
+- 层：`0, 10, 20, 30, 42`
+- 每层采样 expert 数：`32`
+- projection：`w1, w2, w3`
+- 总矩阵数：`5 layers * 32 experts * 3 projections = 480`
+- `row span`：同一个 output channel 内，所有 K/32 block 的 `max(exp) - min(exp)`。
+- overflow：按 repack 后的目标 INT8 值统计是否超过 `[-128, 127]`。
+- exact nonzero：只在原始非零权重上统计 repack 前后的数值是否完全一致。
+
+`headroom_bits=3` 的采样结果：
+
+| 指标 | 数值 | 说明 |
+|---|---:|---|
+| sampled matrices | 480 | 5 层、每层 32 个 expert、3 个 projection |
+| overflow count | 0 | 没有观察到 INT8 溢出 |
+| max matrix overflow rate | 0 | 任一矩阵内的最大溢出比例 |
+| worst nonzero exact rate | 0.9992876 | 最差矩阵的非零权重精确保留比例 |
+| worst mean relative error, nonzero | 0.0005060 | 最差矩阵的非零权重平均相对误差 |
+| max remapped zero rate | 0.1551187 | remap 后为 zero 的最大比例 |
+| matrix max scale exponent p50 | -5 | 每个矩阵先取 row max exponent，再做分位数 |
+| matrix max scale exponent p90 | -4 | 同上 |
+| matrix max scale exponent p99 | -2 | 同上 |
+| matrix max row span p50 | 2 | 每个矩阵先取 row span 最大值，再做分位数 |
+| matrix max row span p90 | 3 | 同上 |
+| matrix max row span p99 | 4.21 | 同上 |
+| worst matrix row span | 5 | 采样中最差 row span |
+
+最差采样矩阵是 `layer=42, expert=14, projection=w2`：
+
+| 指标 | 数值 |
+|---|---:|
+| exact_rate_nonzero | 0.9992876 |
+| row_span_max | 5 |
+| row_span_p99 | 4 |
+| mean_rel_err_nonzero | 0.0005060 |
+
+因此 `headroom_bits=3` 在采样 routed expert 权重上没有观察到 INT8 overflow，大部分
+非零权重可以精确保留。这是 DeepSeek V4 权重格式约束和实际 scale 分布共同作用的
+结果，不是任意 MXFP4 权重都自动成立。它仍然是近似格式，不应该描述为 bit-exact
+MXFP4 dequant。
 
 ## 权重布局
 
