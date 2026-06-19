@@ -64,7 +64,7 @@ def _try_prewarm_mxfp4_int8_moe_jit(
     if _MXFP4_INT8_MOE_JIT_AVAILABLE is False:
         return
     try:
-        from sglang.jit_kernel.mxfp4_int8_moe import (
+        from sglang_jit_patches.mxfp4_int8_moe import (
             prewarm_mxfp4_int8_moe_jit_modules,
         )
 
@@ -109,7 +109,7 @@ def _mxfp4_int8_moe_grouped_gemm_nt(
     global _MXFP4_INT8_MOE_JIT_AVAILABLE
     if _mxfp4_int8_moe_jit_enabled() and _MXFP4_INT8_MOE_JIT_AVAILABLE is not False:
         try:
-            from sglang.jit_kernel.mxfp4_int8_moe import mxfp4_int8_moe_gemm
+            from sglang_jit_patches.mxfp4_int8_moe import mxfp4_int8_moe_gemm
 
             routed_out = None
             if mul_topk_weights:
