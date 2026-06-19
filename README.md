@@ -81,7 +81,7 @@ bash scripts/launch_dsv4_flash_int4_sglang.sh
 - `docs/model_conversion.md`: MXFP4 and INT4 conversion scripts.
 - `docs/sglang_version.md`: SGLang version and integration assumptions.
 - `docs/runtime_env.md`: launch environment variables.
-- `docs/benchmarks.md`: MoE microbenchmarks and serving throughput notes.
+- `docs/micro_benchmark.md`: dense/MoE microbenchmarks and serving throughput notes.
 
 ## Notes
 
