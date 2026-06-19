@@ -14,6 +14,7 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger(__name__)
 _PATCH_APPLIED = False
+_MXFP4_INT8_FUNC_ATTRS_INITIALIZED: set[int] = set()
 
 
 def _env_enabled(name: str, default: str = "1") -> bool:
@@ -30,6 +31,28 @@ def _get_tensor_cache(obj, attr: str) -> dict:
         cache = {}
         setattr(obj, attr, cache)
     return cache
+
+
+def _init_mxfp4_int8_cuda_func_attributes_once(device: torch.device | None) -> None:
+    if device is None or device.type != "cuda":
+        return
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if device_index in _MXFP4_INT8_FUNC_ATTRS_INITIALIZED:
+        return
+
+    import mxfp4_int8  # noqa: F401
+
+    with torch.cuda.device(device_index):
+        initialized = torch.ops.mxfp4_int8.init_cuda_func_attributes()
+    _MXFP4_INT8_FUNC_ATTRS_INITIALIZED.add(device_index)
+    logger.warning(
+        "Monkey patch: initialized mxfp4_int8 CUDA function attributes "
+        "for device %d (%d kernels).",
+        device_index,
+        initialized,
+    )
 
 
 def _can_sync_cuda() -> bool:
@@ -401,8 +424,14 @@ def _patch_dsv4_mxfp4_moe_a100() -> None:
             if moe_backend in {"mxfp4_int8", "int8", "cutlass"}:
                 from triton_kernels import prepare_mxfp4_int8_moe
 
+                _init_mxfp4_int8_cuda_func_attributes_once(layer.w13_weight.device)
                 headroom_bits = int(os.environ.get("SGLANG_DSV4_MXFP4_INT8_HEADROOM_BITS", "3"))
-                prepare_mxfp4_int8_moe(layer, headroom_bits=headroom_bits)
+                topk = (
+                    int(self.runner.config.num_experts_per_tok)
+                    if hasattr(self.runner.config, "num_experts_per_tok")
+                    else None
+                )
+                prepare_mxfp4_int8_moe(layer, headroom_bits=headroom_bits, topk=topk)
                 layer._dsv4_mxfp4_backend = "a100_mxfp4_int8"
                 logger.warning(
                     "Monkey patch: using mxfp4_int8 MoE for %s "

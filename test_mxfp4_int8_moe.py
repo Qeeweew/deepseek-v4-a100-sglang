@@ -3,6 +3,8 @@ import torch
 
 from triton_kernels.mxfp4_int8_moe import (
     _compute_remap_stats,
+    _ensure_extension_loaded,
+    _moe_align_block_size,
     mxfp4_int8_dense_forward,
     mxfp4_int8_moe_forward,
     prepare_mxfp4_int8_dense_weight,
@@ -144,6 +146,120 @@ def test_mxfp4_int8_dense_matches_original_mxfp4_reference():
     assert _relative_l2(out, ref) < 0.04
 
 
+def test_mxfp4_int8_moe_jit_matches_torch_extension_grouped_gemm():
+    _ensure_extension_loaded()
+    torch.manual_seed(20260621)
+    experts, tokens, hidden, intermediate, topk = 4, 13, 128, 128, 2
+    block_m = 16
+    w13, s13 = _make_random_packed_mxfp4(experts, 2 * intermediate, hidden, seed=21)
+    w2, s2 = _make_random_packed_mxfp4(experts, hidden, intermediate, seed=22)
+    w13_mxfp4, w13_shift2, w13_scale = remap_mxfp4_weight_for_int8(w13, s13)
+    w2_mxfp4, w2_shift2, w2_scale = remap_mxfp4_weight_for_int8(w2, s2)
+
+    topk_ids = torch.stack(
+        [
+            torch.arange(tokens, device="cuda", dtype=torch.int32) % experts,
+            (torch.arange(tokens, device="cuda", dtype=torch.int32) * 3 + 1) % experts,
+        ],
+        dim=1,
+    )
+    topk_weights = torch.softmax(
+        torch.randn(tokens, topk, device="cuda", dtype=torch.float32), dim=-1
+    )
+    sorted_token_ids, expert_ids, num_tokens_post_padded = _moe_align_block_size(
+        topk_ids, block_m, experts
+    )
+
+    from sglang.jit_kernel.mxfp4_int8_moe import mxfp4_int8_moe_gemm
+
+    hidden_states = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.2
+    a13_q, a13_scale = torch.ops.mxfp4_int8.quantize_per_token(hidden_states, 0.0)
+    jit_w13 = torch.empty((tokens * topk, 2 * intermediate), device="cuda", dtype=torch.bfloat16)
+    ref_w13 = torch.empty_like(jit_w13)
+    mxfp4_int8_moe_gemm(
+        a13_q,
+        a13_scale,
+        w13_mxfp4,
+        w13_shift2,
+        w13_scale,
+        jit_w13,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        topk=topk,
+        block_m=block_m,
+        source_rows_are_slots=False,
+        num_valid_tokens=tokens * topk,
+    )
+    torch.ops.mxfp4_int8.moe_grouped_gemm_nt(
+        a13_q,
+        a13_scale,
+        w13_mxfp4,
+        w13_shift2,
+        w13_scale,
+        ref_w13,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk,
+        block_m,
+        False,
+        tokens * topk,
+        2 * intermediate,
+        hidden,
+    )
+
+    intermediate_states = torch.nn.functional.silu(jit_w13[:, :intermediate]) * jit_w13[:, intermediate:]
+    a2_q, a2_scale = torch.ops.mxfp4_int8.quantize_per_token(intermediate_states.contiguous(), 0.0)
+    jit_out = torch.empty((tokens, hidden), device="cuda", dtype=torch.bfloat16)
+    ref_out = torch.empty_like(jit_out)
+    routed_workspace = torch.empty((tokens * topk, hidden), device="cuda", dtype=torch.bfloat16)
+    mxfp4_int8_moe_gemm(
+        a2_q,
+        a2_scale,
+        w2_mxfp4,
+        w2_shift2,
+        w2_scale,
+        jit_out,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        topk=topk,
+        block_m=block_m,
+        source_rows_are_slots=True,
+        num_valid_tokens=tokens * topk,
+        routed_out=routed_workspace,
+    )
+    torch.ops.mxfp4_int8.moe_grouped_gemm_nt(
+        a2_q,
+        a2_scale,
+        w2_mxfp4,
+        w2_shift2,
+        w2_scale,
+        ref_out,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk,
+        block_m,
+        True,
+        tokens * topk,
+        hidden,
+        intermediate,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(jit_w13, ref_w13, atol=0, rtol=0)
+    torch.testing.assert_close(jit_out, ref_out, atol=0, rtol=0)
+
+
 def test_mxfp4_int8_moe_is_closer_to_original_mxfp4_than_rowwise_int4():
     torch.manual_seed(20260618)
 
@@ -159,7 +275,7 @@ def test_mxfp4_int8_moe_is_closer_to_original_mxfp4_than_rowwise_int4():
     layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
     layer.w13_weight_scale_inv = torch.nn.Parameter(s13, requires_grad=False)
     layer.w2_weight_scale_inv = torch.nn.Parameter(s2, requires_grad=False)
-    prepare_mxfp4_int8_moe(layer, headroom_bits=3)
+    prepare_mxfp4_int8_moe(layer, headroom_bits=3, topk=topk)
     assert layer.w13_weight.numel() == 0
     assert layer.w2_weight.numel() == 0
     assert layer.w13_weight_scale_inv.numel() == 0

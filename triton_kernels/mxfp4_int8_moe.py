@@ -23,6 +23,7 @@ _E2M1_SIGNED_X2 = torch.tensor(
     [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12],
     dtype=torch.float32,
 )
+_MXFP4_INT8_MOE_JIT_AVAILABLE: bool | None = None
 
 
 @dataclass
@@ -46,6 +47,122 @@ class Mxfp4Int8DenseWeight:
 
 def _ensure_extension_loaded() -> None:
     import mxfp4_int8  # noqa: F401
+
+
+def _mxfp4_int8_moe_jit_enabled() -> bool:
+    env = os.environ.get("SGLANG_DSV4_MXFP4_INT8_USE_JIT", "1").strip().lower()
+    return env not in {"0", "false", "no", "off"}
+
+
+def _try_prewarm_mxfp4_int8_moe_jit(
+    *, hidden_size: int, intermediate_size: int, topk: int
+) -> None:
+    global _MXFP4_INT8_MOE_JIT_AVAILABLE
+    if not _mxfp4_int8_moe_jit_enabled():
+        _MXFP4_INT8_MOE_JIT_AVAILABLE = False
+        return
+    if _MXFP4_INT8_MOE_JIT_AVAILABLE is False:
+        return
+    try:
+        from sglang.jit_kernel.mxfp4_int8_moe import (
+            prewarm_mxfp4_int8_moe_jit_modules,
+        )
+
+        block_ms_env = os.environ.get("SGLANG_DSV4_MXFP4_INT8_JIT_PREWARM_BLOCK_M")
+        if block_ms_env is None:
+            selected_block_m = os.environ.get("SGLANG_DSV4_MXFP4_INT8_BLOCK_M")
+            block_ms = (int(selected_block_m),) if selected_block_m else (16, 128)
+        else:
+            block_ms = tuple(
+                int(item) for item in block_ms_env.replace(";", ",").split(",") if item.strip()
+            )
+        prewarm_mxfp4_int8_moe_jit_modules(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            topk=topk,
+            block_ms=block_ms,
+        )
+        _MXFP4_INT8_MOE_JIT_AVAILABLE = True
+    except Exception:
+        _MXFP4_INT8_MOE_JIT_AVAILABLE = False
+        logger.exception("MXFP4-int8 MoE JIT prewarm failed; falling back to torch extension")
+
+
+def _mxfp4_int8_moe_grouped_gemm_nt(
+    a_q: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_mxfp4: torch.Tensor,
+    b_shift2: torch.Tensor,
+    b_channel_scale: torch.Tensor,
+    out: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk: int,
+    block_size_m: int,
+    mul_topk_weights: bool,
+    num_valid_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> None:
+    global _MXFP4_INT8_MOE_JIT_AVAILABLE
+    if _mxfp4_int8_moe_jit_enabled() and _MXFP4_INT8_MOE_JIT_AVAILABLE is not False:
+        try:
+            from sglang.jit_kernel.mxfp4_int8_moe import mxfp4_int8_moe_gemm
+
+            routed_out = None
+            if mul_topk_weights:
+                routed_out = torch.empty(
+                    (num_valid_tokens, hidden_size),
+                    device=out.device,
+                    dtype=out.dtype,
+                )
+            mxfp4_int8_moe_gemm(
+                a_q,
+                a_scale,
+                b_mxfp4,
+                b_shift2,
+                b_channel_scale,
+                out,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                topk=topk,
+                block_m=block_size_m,
+                source_rows_are_slots=mul_topk_weights,
+                num_valid_tokens=num_valid_tokens,
+                routed_out=routed_out,
+            )
+            _MXFP4_INT8_MOE_JIT_AVAILABLE = True
+            return
+        except Exception:
+            _MXFP4_INT8_MOE_JIT_AVAILABLE = False
+            logger.exception("MXFP4-int8 MoE JIT launch failed; falling back to torch extension")
+
+    size_n = hidden_size if mul_topk_weights else intermediate_size * 2
+    size_k = intermediate_size if mul_topk_weights else hidden_size
+    torch.ops.mxfp4_int8.moe_grouped_gemm_nt(
+        a_q,
+        a_scale,
+        b_mxfp4,
+        b_shift2,
+        b_channel_scale,
+        out,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk,
+        block_size_m,
+        mul_topk_weights,
+        num_valid_tokens,
+        size_n,
+        size_k,
+    )
 
 
 def _as_uint8_storage(tensor: torch.Tensor) -> torch.Tensor:
@@ -498,6 +615,7 @@ def prepare_mxfp4_int8_moe(
     layer: torch.nn.Module,
     *,
     headroom_bits: int = 3,
+    topk: int | None = None,
 ) -> None:
     _ensure_extension_loaded()
     repack_backend = os.environ.get("SGLANG_DSV4_MXFP4_INT8_REPACK_BACKEND", "triton").strip().lower()
@@ -525,6 +643,15 @@ def prepare_mxfp4_int8_moe(
         w2_channel_scale=w2_channel_scale,
         headroom_bits=headroom_bits,
     )
+    if topk is None:
+        topk = int(getattr(layer, "top_k", 0) or getattr(layer, "topk", 0) or 8)
+    hidden_size = int(w2_channel_scale.shape[1])
+    intermediate_size = int(w2_mxfp4.shape[1] * 32)
+    _try_prewarm_mxfp4_int8_moe_jit(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        topk=topk,
+    )
     empty_u8 = torch.empty(0, device=w13_mxfp4.device, dtype=torch.uint8)
     empty_i8 = empty_u8.view(torch.int8)
     layer.w13_weight = Parameter(empty_i8, requires_grad=False)
@@ -537,13 +664,13 @@ def _select_block_size_m(m: int, topk: int, experts: int) -> int:
     env = os.environ.get("SGLANG_DSV4_MXFP4_INT8_BLOCK_M", "").strip()
     if env:
         block = int(env)
-        if block not in {16, 32, 64}:
-            raise ValueError("SGLANG_DSV4_MXFP4_INT8_BLOCK_M must be 16, 32, or 64")
+        if block not in {16, 32, 64, 128}:
+            raise ValueError("SGLANG_DSV4_MXFP4_INT8_BLOCK_M must be 16, 32, 64, or 128")
         return block
-    for block in (16, 32):
+    for block in (16,):
         if m * topk / max(experts, 1) / block < 0.9:
             return block
-    return 64
+    return 128
 
 
 def _moe_align_block_size(
@@ -621,7 +748,7 @@ def mxfp4_int8_moe_forward(
         device=hidden_states.device,
         dtype=torch.bfloat16,
     )
-    torch.ops.mxfp4_int8.moe_grouped_gemm_nt(
+    _mxfp4_int8_moe_grouped_gemm_nt(
         a13_q,
         a13_scale,
         weights.w13_mxfp4,
@@ -636,13 +763,13 @@ def mxfp4_int8_moe_forward(
         block_size_m,
         False,
         m * topk,
-        intermediate_size * 2,
         hidden_size,
+        intermediate_size,
     )
     intermediate = _apply_swiglu(gate_up, clamp_limit).contiguous()
     a2_q, a2_scale = torch.ops.mxfp4_int8.quantize_per_token(intermediate, 0.0)
     out = torch.empty((m, hidden_size), device=hidden_states.device, dtype=torch.bfloat16)
-    torch.ops.mxfp4_int8.moe_grouped_gemm_nt(
+    _mxfp4_int8_moe_grouped_gemm_nt(
         a2_q,
         a2_scale,
         weights.w2_mxfp4,
