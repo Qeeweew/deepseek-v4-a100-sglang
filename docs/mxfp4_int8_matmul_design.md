@@ -96,11 +96,11 @@ MXFP4 原始格式有 per-32 block 的 UE8M0 scale，而 runtime 格式只有 ro
 加 2-bit shift。对于 row 内 scale span 很大的情况，某些 block 不能被精确表示。
 repack 会把目标值四舍五入到最近的 E2M1 code。
 
-DeepSeek V4 的 MXFP4 权重并不是任意 scale 分布。为了让 MXFP4 权重能够无损转换到
-FP8 表示，同一个 output channel 内的 block scale 差距被限制在 64 倍以内，也就是
-exponent span 不超过 6。这个约束给 INT8 repack 提供了基础：默认
-`headroom_bits=3` 时，较大的 block 可以通过 2-bit shift 表示，较小的 block 即使
-需要折进 E2M1 code，也不会落在完全失控的 scale 区间。
+DeepSeek V4 的 MXFP4 权重并不是任意 scale 分布。它的权重格式需要兼容
+128x128 FP8 block 的转换路径，因此 scale 组织本身已经服务于 block 级转换，而
+不是完全自由的 per-32 scale 分布。这个约束给 INT8 repack 提供了基础：默认
+`headroom_bits=3` 时，较大的 block 可以通过 2-bit shift 表示，较小的 block 再
+折进 E2M1 code。
 
 最近 E2M1 code 的选择基于 doubled magnitude 阈值：
 
@@ -122,7 +122,7 @@ else    -> 12
 ```
 
 符号位从原始 code 保留，原始 zero 仍映射为 zero。实验仓库中的统计脚本进一步
-说明，实际 routed expert 权重的 scale 通常比 64 倍上界集中得多。
+说明，实际 routed expert 权重的 scale 分布非常集中。
 
 统计使用实验仓库脚本：
 
