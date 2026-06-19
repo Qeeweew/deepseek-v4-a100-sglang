@@ -64,6 +64,15 @@ def _can_sync_cuda() -> bool:
         return True
 
 
+def _is_cuda_stream_capturing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
 @contextlib.contextmanager
 def _record_function(name: str):
     with torch.profiler.record_function(f"dsv4_a100_patch::{name}"):
@@ -603,21 +612,29 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
         q_entry = q_cache.get(q_key)
         q_out = None if q_entry is None else q_entry["tensor"]
         if q_out is None or q_out.shape[0] < q.shape[0]:
-            retired = [] if q_entry is None else q_entry.setdefault("retired", [])
-            if q_out is not None:
-                retired.append(q_out)
+            captured_tensors = [] if q_entry is None else q_entry.setdefault("captured_tensors", [])
+            if q_out is not None and q_entry.get("captured", False):
+                captured_tensors.append(q_out)
             q_out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
-            q_cache[q_key] = {"tensor": q_out, "retired": retired}
+            q_cache[q_key] = {
+                "tensor": q_out,
+                "captured": _is_cuda_stream_capturing(),
+                "captured_tensors": captured_tensors,
+            }
         else:
             q_out = q_out[: q.shape[0]]
         w_entry = weight_cache.get(w_key)
         weights_out = None if w_entry is None else w_entry["tensor"]
         if weights_out is None or weights_out.shape[0] < w_shape[0]:
-            retired = [] if w_entry is None else w_entry.setdefault("retired", [])
-            if weights_out is not None:
-                retired.append(weights_out)
+            captured_tensors = [] if w_entry is None else w_entry.setdefault("captured_tensors", [])
+            if weights_out is not None and w_entry.get("captured", False):
+                captured_tensors.append(weights_out)
             weights_out = torch.empty(w_shape, device=weight.device, dtype=torch.float32)
-            weight_cache[w_key] = {"tensor": weights_out, "retired": retired}
+            weight_cache[w_key] = {
+                "tensor": weights_out,
+                "captured": _is_cuda_stream_capturing(),
+                "captured_tensors": captured_tensors,
+            }
         else:
             weights_out = weights_out[: w_shape[0]]
         if freqs_real is None or freqs_real.device != self.freqs_cis.device:
@@ -1020,15 +1037,16 @@ def _patch_deepseek_v4_backend() -> None:
                 cached["gathered"][:q_tokens, :total_topk, :],
                 cached["invalid_mask"][:q_tokens, :total_topk],
             )
-        retired = [] if cached is None else cached.setdefault("retired", [])
-        if cached is not None:
-            retired.extend([cached["gathered"], cached["invalid_mask"]])
+        captured_tensors = [] if cached is None else cached.setdefault("captured_tensors", [])
+        if cached is not None and cached.get("captured", False):
+            captured_tensors.extend([cached["gathered"], cached["invalid_mask"]])
         gathered = torch.empty((q_tokens, total_topk, head_dim), dtype=torch.bfloat16, device=device)
         invalid_mask = torch.empty((q_tokens, total_topk), dtype=torch.bool, device=device)
         cache[needed] = {
             "gathered": gathered,
             "invalid_mask": invalid_mask,
-            "retired": retired,
+            "captured": _is_cuda_stream_capturing(),
+            "captured_tensors": captured_tensors,
         }
         return gathered, invalid_mask
 
@@ -1044,15 +1062,16 @@ def _patch_deepseek_v4_backend() -> None:
         cached = cache.get(needed)
         if cached is not None and cached["output"].shape[0] >= q_tokens:
             return cached["output"][:q_tokens], cached["lse"][:q_tokens]
-        retired = [] if cached is None else cached.setdefault("retired", [])
-        if cached is not None:
-            retired.extend([cached["output"], cached["lse"]])
+        captured_tensors = [] if cached is None else cached.setdefault("captured_tensors", [])
+        if cached is not None and cached.get("captured", False):
+            captured_tensors.extend([cached["output"], cached["lse"]])
         output = torch.empty((q_tokens, q_heads, head_dim), dtype=torch.bfloat16, device=device)
         lse = torch.empty((q_tokens, q_heads), dtype=torch.float32, device=device)
         cache[needed] = {
             "output": output,
             "lse": lse,
-            "retired": retired,
+            "captured": _is_cuda_stream_capturing(),
+            "captured_tensors": captured_tensors,
         }
         return output, lse
 
@@ -1067,11 +1086,15 @@ def _patch_deepseek_v4_backend() -> None:
         cached = cache.get(needed)
         if cached is not None and cached["lse"].shape[0] >= q_tokens:
             return cached["lse"][:q_tokens]
-        retired = [] if cached is None else cached.setdefault("retired", [])
-        if cached is not None:
-            retired.append(cached["lse"])
+        captured_tensors = [] if cached is None else cached.setdefault("captured_tensors", [])
+        if cached is not None and cached.get("captured", False):
+            captured_tensors.append(cached["lse"])
         lse = torch.empty((q_tokens, q_heads), dtype=torch.float32, device=device)
-        cache[needed] = {"lse": lse, "retired": retired}
+        cache[needed] = {
+            "lse": lse,
+            "captured": _is_cuda_stream_capturing(),
+            "captured_tensors": captured_tensors,
+        }
         return lse
 
     def forward(
