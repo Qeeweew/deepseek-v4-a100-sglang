@@ -60,8 +60,8 @@ should happen inside a CUDA graph capture interval.
 The source tree is arranged as an installable Python package:
 
 - `dsv4_a100_patch/`: runtime code and JIT kernel headers.
-- `triton_kernels/`: compatibility import shim for older internal paths that
-  imported patch kernels from the top-level `triton_kernels` namespace.
+- `dsv4_a100_patch/triton_kernels/`: patch-owned Triton kernels and Python
+  integration helpers.
 - `scripts/`: conversion and launch scripts.
 - `docs/`: design, version, and operating notes.
 

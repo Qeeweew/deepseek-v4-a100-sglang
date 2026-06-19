@@ -76,6 +76,7 @@ bash scripts/launch_dsv4_flash_int4_sglang.sh
 ## Documentation
 
 - `docs/design.md`: runtime architecture and patch scope.
+- `docs/mxfp4_int8_matmul_design.md`: MXFP4/INT8 matmul design from repack to CUTLASS.
 - `docs/mxfp4_int8_moe.md`: MXFP4/INT8 MoE design.
 - `docs/moe_operator_limitations.md`: why routed MoE does not saturate like dense GEMM.
 - `docs/model_conversion.md`: MXFP4 and INT4 conversion scripts.
