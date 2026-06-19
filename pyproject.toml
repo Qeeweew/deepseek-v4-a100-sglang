@@ -27,7 +27,6 @@ packages = [
   "dsv4_a100_patch",
   "dsv4_a100_patch.triton_kernels",
   "dsv4_a100_patch.sglang_jit_patches",
-  "triton_kernels",
 ]
 
 [tool.setuptools.package-data]

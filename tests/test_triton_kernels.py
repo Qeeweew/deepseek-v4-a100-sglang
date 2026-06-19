@@ -3,7 +3,7 @@ import os
 import pytest
 import torch
 
-from triton_kernels import (
+from dsv4_a100_patch.triton_kernels import (
     bf16_indexer_q,
     bf16_indexer_q_torch,
     bf16_paged_mqa_logits,
@@ -264,7 +264,7 @@ def test_mxfp4_moe_ogs_smoke_keeps_e8m0_scales():
     topk_weights = torch.full(
         (tokens, topk), 1.0 / topk, device="cuda", dtype=torch.float32
     )
-    from triton_kernels.mxfp4_moe_ogs import _make_routing_data
+    from dsv4_a100_patch.triton_kernels.mxfp4_moe_ogs import _make_routing_data
 
     routing_data, _, _ = _make_routing_data(topk_ids, topk_weights, experts)
     assert routing_data.n_expts_act == topk

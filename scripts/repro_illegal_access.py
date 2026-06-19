@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import torch
 
-from triton_kernels import direct_dual_sparse_attention, direct_sparse_attention
+from dsv4_a100_patch.triton_kernels import (
+    direct_dual_sparse_attention,
+    direct_sparse_attention,
+)
 
 
 def _run_single(q_tokens: int, heads: int, dim: int, topk: int) -> None:

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from triton_kernels.mxfp4_int8_moe import (
+from dsv4_a100_patch.triton_kernels.mxfp4_int8_moe import (
     _compute_remap_stats,
     _moe_align_block_size,
     mxfp4_int8_dense_forward,

@@ -31,7 +31,10 @@ def test_patch_imports_and_rope_symbol():
 def test_patch_sets_mxfp4_moe_ogs_path():
     apply_patch()
     from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
-    from triton_kernels import mxfp4_moe_forward_ogs, prepare_mxfp4_moe_ogs
+    from dsv4_a100_patch.triton_kernels import (
+        mxfp4_moe_forward_ogs,
+        prepare_mxfp4_moe_ogs,
+    )
 
     assert Mxfp4MarlinMoEMethod.apply.__module__ == "dsv4_a100_patch.patch"
     assert (
