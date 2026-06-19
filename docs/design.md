@@ -30,10 +30,9 @@ and is compiled through SGLang's JIT loader. CUTLASS is resolved from the
 SGLang runtime environment; this project does not vendor CUTLASS and does not
 ship a separate public CUDA operator package.
 
-Per-token INT8 activation quantization for the MoE path is implemented as a
-Triton kernel in this package. The old `mxfp4_int8` torch extension namespace
-is only used by the dense helper and by the explicit fallback path if the JIT
-path is disabled or fails.
+Per-token INT8 activation quantization is implemented as a Triton kernel in
+this package. Dense and routed-expert MXFP4/INT8 GEMMs are compiled from this
+package's SGLang JIT headers.
 
 ## MXFP4 Serving Path
 

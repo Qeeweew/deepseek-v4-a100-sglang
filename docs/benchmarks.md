@@ -23,6 +23,12 @@ path:
 dsv4_a100_patch.sglang_jit_patches.mxfp4_int8_moe.mxfp4_int8_moe_gemm
 ```
 
+The dense MXFP4/INT8 benchmark directly calls:
+
+```text
+dsv4_a100_patch.sglang_jit_patches.mxfp4_int8_dense.mxfp4_int8_dense_gemm
+```
+
 The baseline is the original Triton/OGS MXFP4 implementation through this
 repository's benchmark script:
 
@@ -30,9 +36,58 @@ repository's benchmark script:
 scripts/bench_mxfp4_int8_jit_moe.py --backend ogs
 ```
 
-Historical `torch.ops.mxfp4_int8` extension results are intentionally not used
-in the table below. The table was re-measured against the current SGLang-JIT
-path with the same batch list, warmup, and iteration count as the OGS baseline.
+The table below was re-measured against the current SGLang-JIT path with the
+same batch list, warmup, and iteration count as the OGS baseline.
+
+## Dense Microbenchmark
+
+The dense benchmark is used to validate the raw packed-weight GEMM path without
+MoE routing overhead:
+
+```bash
+SGLANG_ROOT=/workspace/sglang \
+PYTHONPATH=/workspace/monkeypatch:/workspace/sglang/python \
+CUDA_VISIBLE_DEVICES=0 \
+python scripts/bench_mxfp4_int8_jit_dense.py \
+  --n 8192 \
+  --k 8192 \
+  --batches 1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384 \
+  --warmup 10 \
+  --iters 30 \
+  --output-dir /workspace/monkeypatch/benchmark_results_dense_jit_cudagraph
+```
+
+Large-batch dense GEMM is expected to be much closer to A100 tensor-core peak
+than routed MoE because it has one regular GEMM grid and no routing, padding,
+activation, quantization, workspace, or top-k reduction overhead.
+
+Current SGLang-JIT dense results for `N=8192`, `K=8192`, `warmup=10`,
+`iters=30`. Each measured path is captured once and timed with CUDA graph
+replay:
+
+| batch | quant ms | GEMM ms | quant+GEMM ms | GEMM TFLOPS | quant+GEMM TFLOPS |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.0043 | 0.0495 | 0.0528 | 2.7 | 2.5 |
+| 2 | 0.0043 | 0.0494 | 0.0527 | 5.4 | 5.1 |
+| 4 | 0.0042 | 0.0496 | 0.0528 | 10.8 | 10.2 |
+| 8 | 0.0042 | 0.0499 | 0.0530 | 21.5 | 20.3 |
+| 16 | 0.0046 | 0.0484 | 0.0517 | 44.4 | 41.5 |
+| 32 | 0.0043 | 0.0645 | 0.0681 | 66.6 | 63.1 |
+| 64 | 0.0042 | 0.0731 | 0.0773 | 117.4 | 111.1 |
+| 128 | 0.0046 | 0.0931 | 0.0983 | 184.4 | 174.7 |
+| 256 | 0.0053 | 0.2053 | 0.2117 | 167.4 | 162.3 |
+| 512 | 0.0071 | 0.3313 | 0.3425 | 207.4 | 200.7 |
+| 1024 | 0.0100 | 0.5184 | 0.5344 | 265.1 | 257.2 |
+| 2048 | 0.0335 | 0.9875 | 1.0148 | 278.3 | 270.9 |
+| 4096 | 0.0617 | 1.5474 | 1.6054 | 355.3 | 342.5 |
+| 8192 | 0.1177 | 3.1024 | 3.2091 | 354.4 | 342.6 |
+| 16384 | 0.2329 | 6.2631 | 6.4852 | 351.1 | 339.1 |
+
+For `M=1`, Nsight Compute confirms the dense path now uses the same small-M
+split-K heuristic as the original design: `16x64x128` on-demand GEMM,
+split-K `4`, grid `1x128x4`, followed by a bf16 scale/reduce kernel. The
+profiled main GEMM launch was about `48.3 us`, with the reduce launch about
+`3.6 us`.
 
 ## MoE Microbenchmark TP=8
 

@@ -3,7 +3,6 @@ import torch
 
 from triton_kernels.mxfp4_int8_moe import (
     _compute_remap_stats,
-    _ensure_extension_loaded,
     _moe_align_block_size,
     mxfp4_int8_dense_forward,
     mxfp4_int8_moe_forward,
@@ -136,14 +135,16 @@ def test_triton_repack_matches_torch_repack_bitwise():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_triton_quantize_per_token_matches_extension(dtype):
-    _ensure_extension_loaded()
+def test_triton_quantize_per_token_matches_torch_reference(dtype):
     gen = torch.Generator(device="cuda")
     gen.manual_seed(20260622)
     a = torch.randn((17, 129), device="cuda", dtype=dtype, generator=gen) * 0.5
     a[0].zero_()
     tri_q, tri_scale = quantize_per_token_int8(a, 0.0)
-    ref_q, ref_scale = torch.ops.mxfp4_int8.quantize_per_token(a.contiguous(), 0.0)
+    ref_f = a.float()
+    ref_scale = ref_f.abs().amax(dim=1) / 127.0
+    ref_scale = torch.where(ref_scale == 0.0, torch.ones_like(ref_scale), ref_scale)
+    ref_q = torch.round(ref_f / ref_scale[:, None]).clamp(-127, 127).to(torch.int8)
     torch.cuda.synchronize()
     torch.testing.assert_close(tri_q, ref_q, atol=0, rtol=0)
     torch.testing.assert_close(tri_scale, ref_scale, atol=0, rtol=0)
@@ -161,8 +162,7 @@ def test_mxfp4_int8_dense_matches_original_mxfp4_reference():
     assert _relative_l2(out, ref) < 0.04
 
 
-def test_mxfp4_int8_moe_jit_matches_torch_extension_grouped_gemm():
-    _ensure_extension_loaded()
+def test_mxfp4_int8_moe_direct_jit_matches_original_mxfp4_reference():
     torch.manual_seed(20260621)
     experts, tokens, hidden, intermediate, topk = 4, 13, 128, 128, 2
     block_m = 16
@@ -190,9 +190,8 @@ def test_mxfp4_int8_moe_jit_matches_torch_extension_grouped_gemm():
     )
 
     hidden_states = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.2
-    a13_q, a13_scale = torch.ops.mxfp4_int8.quantize_per_token(hidden_states, 0.0)
+    a13_q, a13_scale = quantize_per_token_int8(hidden_states, 0.0)
     jit_w13 = torch.empty((tokens * topk, 2 * intermediate), device="cuda", dtype=torch.bfloat16)
-    ref_w13 = torch.empty_like(jit_w13)
     mxfp4_int8_moe_gemm(
         a13_q,
         a13_scale,
@@ -211,29 +210,10 @@ def test_mxfp4_int8_moe_jit_matches_torch_extension_grouped_gemm():
         source_rows_are_slots=False,
         num_valid_tokens=tokens * topk,
     )
-    torch.ops.mxfp4_int8.moe_grouped_gemm_nt(
-        a13_q,
-        a13_scale,
-        w13_mxfp4,
-        w13_shift2,
-        w13_scale,
-        ref_w13,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk,
-        block_m,
-        False,
-        tokens * topk,
-        2 * intermediate,
-        hidden,
-    )
 
     intermediate_states = torch.nn.functional.silu(jit_w13[:, :intermediate]) * jit_w13[:, intermediate:]
-    a2_q, a2_scale = torch.ops.mxfp4_int8.quantize_per_token(intermediate_states.contiguous(), 0.0)
+    a2_q, a2_scale = quantize_per_token_int8(intermediate_states.contiguous(), 0.0)
     jit_out = torch.empty((tokens, hidden), device="cuda", dtype=torch.bfloat16)
-    ref_out = torch.empty_like(jit_out)
     routed_workspace = torch.empty((tokens * topk, hidden), device="cuda", dtype=torch.bfloat16)
     mxfp4_int8_moe_gemm(
         a2_q,
@@ -254,27 +234,17 @@ def test_mxfp4_int8_moe_jit_matches_torch_extension_grouped_gemm():
         num_valid_tokens=tokens * topk,
         routed_out=routed_workspace,
     )
-    torch.ops.mxfp4_int8.moe_grouped_gemm_nt(
-        a2_q,
-        a2_scale,
-        w2_mxfp4,
-        w2_shift2,
-        w2_scale,
-        ref_out,
+    ref_out = _mxfp4_moe_reference(
+        hidden_states,
+        w13,
+        s13,
+        w2,
+        s2,
+        topk_ids,
         topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk,
-        block_m,
-        True,
-        tokens * topk,
-        hidden,
-        intermediate,
     )
     torch.cuda.synchronize()
-    torch.testing.assert_close(jit_w13, ref_w13, atol=0, rtol=0)
-    torch.testing.assert_close(jit_out, ref_out, atol=0, rtol=0)
+    assert _relative_l2(jit_out, ref_out) < 0.08
 
 
 def test_mxfp4_int8_moe_is_closer_to_original_mxfp4_than_rowwise_int4():

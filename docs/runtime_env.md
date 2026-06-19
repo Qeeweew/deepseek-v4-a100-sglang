@@ -42,9 +42,8 @@ The MXFP4 path uses `--quantization fp8` as the SGLang loader entry point. The
 patch then replaces routed expert preparation and execution with the MXFP4/INT8
 JIT kernel.
 
-`SGLANG_DSV4_MXFP4_INT8_USE_JIT=1` is the default. Setting it to `0` forces the
-legacy `mxfp4_int8` extension fallback and is intended only for debugging; the
-default path uses this package's SGLang JIT GEMM and Triton activation quantizer.
+`SGLANG_DSV4_MXFP4_INT8_USE_JIT=1` is the default. The supported path uses this
+package's SGLang JIT GEMM and Triton activation quantizer.
 
 The MXFP4/INT8 MoE JIT path selects `(block_m, block_n)` from an A100 static
 tile table by batch size. Use the following variables only for measurement or

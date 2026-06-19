@@ -18,6 +18,7 @@ _E2M1_SIGNED_X2 = torch.tensor(
     dtype=torch.float32,
 )
 _MXFP4_INT8_MOE_JIT_AVAILABLE: bool | None = None
+_MXFP4_INT8_DENSE_JIT_AVAILABLE: bool | None = None
 _VALID_BLOCK_M = {16, 32, 64, 128}
 _VALID_BLOCK_N = {32, 64, 128}
 _DSV4_A100_MXFP4_INT8_TILE_TABLE: tuple[tuple[int, int, int], ...] = (
@@ -49,16 +50,21 @@ class Mxfp4Int8DenseWeight:
     headroom_bits: int
 
 
-def _ensure_extension_loaded() -> None:
-    import mxfp4_int8  # noqa: F401
-
-
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
+    ],
+    key=["K", "BLOCK_K", "clamp_abs"],
+)
 @triton.jit
 def _quantize_per_token_kernel(
     a,
     a_q,
     a_scale,
-    M: tl.constexpr,
+    M,
     K: tl.constexpr,
     clamp_abs: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -116,7 +122,6 @@ def quantize_per_token_int8(
         k,
         float(clamp_abs),
         BLOCK_K=block_k,
-        num_warps=8,
     )
     return a_q, a_scale
 
@@ -182,7 +187,7 @@ def _try_prewarm_mxfp4_int8_moe_jit(
         _MXFP4_INT8_MOE_JIT_AVAILABLE = True
     except Exception:
         _MXFP4_INT8_MOE_JIT_AVAILABLE = False
-        logger.exception("MXFP4-int8 MoE JIT prewarm failed; falling back to torch extension")
+        logger.exception("MXFP4-int8 MoE JIT prewarm failed")
 
 
 def _mxfp4_int8_moe_grouped_gemm_nt(
@@ -240,29 +245,10 @@ def _mxfp4_int8_moe_grouped_gemm_nt(
             return
         except Exception:
             _MXFP4_INT8_MOE_JIT_AVAILABLE = False
-            logger.exception("MXFP4-int8 MoE JIT launch failed; falling back to torch extension")
+            logger.exception("MXFP4-int8 MoE JIT launch failed")
+            raise
 
-    _ensure_extension_loaded()
-    size_n = hidden_size if mul_topk_weights else intermediate_size * 2
-    size_k = intermediate_size if mul_topk_weights else hidden_size
-    torch.ops.mxfp4_int8.moe_grouped_gemm_nt(
-        a_q,
-        a_scale,
-        b_mxfp4,
-        b_shift2,
-        b_channel_scale,
-        out,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk,
-        block_size_m,
-        mul_topk_weights,
-        num_valid_tokens,
-        size_n,
-        size_k,
-    )
+    raise RuntimeError("MXFP4-int8 MoE JIT is disabled or unavailable")
 
 
 def _as_uint8_storage(tensor: torch.Tensor) -> torch.Tensor:
@@ -672,7 +658,6 @@ def prepare_mxfp4_int8_dense_weight(
     *,
     headroom_bits: int = 3,
 ) -> Mxfp4Int8DenseWeight:
-    _ensure_extension_loaded()
     b_mxfp4, b_shift2, channel_scale = remap_mxfp4_weight_for_int8(
         weight.unsqueeze(0),
         scale.unsqueeze(0),
@@ -691,24 +676,53 @@ def mxfp4_int8_dense_forward(
     weight: Mxfp4Int8DenseWeight,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    _ensure_extension_loaded()
+    global _MXFP4_INT8_DENSE_JIT_AVAILABLE
     hidden_states = hidden_states.contiguous()
-    a_q, a_scale = torch.ops.mxfp4_int8.quantize_per_token(hidden_states, 0.0)
+    a_q, a_scale = quantize_per_token_int8(hidden_states, 0.0)
     out = torch.empty(
         (hidden_states.shape[0], weight.weight_channel_scale.shape[0]),
         device=hidden_states.device,
         dtype=torch.bfloat16,
     )
-    torch.ops.mxfp4_int8.dense_gemm_nt(
-        a_q,
-        a_scale,
-        weight.weight_mxfp4,
-        weight.weight_shift2,
-        weight.weight_channel_scale,
-        out,
-        bias,
-    )
-    return out
+    if (
+        bias is None
+        and _mxfp4_int8_moe_jit_enabled()
+        and _MXFP4_INT8_DENSE_JIT_AVAILABLE is not False
+    ):
+        try:
+            from dsv4_a100_patch.sglang_jit_patches.mxfp4_int8_dense import (
+                mxfp4_int8_dense_gemm,
+            )
+
+            mxfp4_int8_dense_gemm(
+                a_q,
+                a_scale,
+                weight.weight_mxfp4,
+                weight.weight_shift2,
+                weight.weight_channel_scale,
+                out,
+                torch.empty(
+                    (
+                        4,
+                        hidden_states.shape[0],
+                        ((weight.weight_channel_scale.shape[0] + 31) // 32) * 32,
+                    ),
+                    device=hidden_states.device,
+                    dtype=torch.int32,
+                )
+                if hidden_states.shape[0] <= 128
+                else torch.empty((0,), device=hidden_states.device, dtype=torch.int32),
+            )
+            _MXFP4_INT8_DENSE_JIT_AVAILABLE = True
+            return out
+        except Exception:
+            _MXFP4_INT8_DENSE_JIT_AVAILABLE = False
+            logger.exception("MXFP4-int8 dense JIT launch failed")
+            raise
+
+    if bias is not None:
+        raise NotImplementedError("MXFP4-int8 dense JIT path does not support bias")
+    raise RuntimeError("MXFP4-int8 dense JIT is disabled or unavailable")
 
 
 def prepare_mxfp4_int8_moe(

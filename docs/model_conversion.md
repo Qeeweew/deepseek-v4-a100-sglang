@@ -63,7 +63,6 @@ The MXFP4 conversion needs PyTorch and safetensors.
 The INT4 conversion additionally needs compressed-tensors, llmcompressor, and
 the MXFP4 dequant helper from `auto_round_extension`.
 
-The default MXFP4 MoE serving path loads routed expert GEMM from this package's
-SGLang JIT headers and uses the in-package Triton activation quantizer. The old
-standalone `mxfp4_int8` experiment extension is only needed for dense helper
-tests or for the explicit fallback path.
+The default MXFP4 serving path loads dense and routed expert GEMMs from this
+package's SGLang JIT headers and uses the in-package Triton activation
+quantizer.

@@ -41,10 +41,8 @@ Use the conversion and launch scripts from the source checkout. The Python
 package contains the runtime patch and JIT headers; repository-level scripts
 and docs are source-tree artifacts.
 
-The MXFP4/INT8 MoE GEMM is loaded through SGLang JIT from this package. The
-default MoE path does not require the old standalone experiment extension.
-The legacy `mxfp4_int8` extension is only needed for the dense helper and for
-forcing the explicit fallback path with `SGLANG_DSV4_MXFP4_INT8_USE_JIT=0`.
+The MXFP4/INT8 dense and MoE GEMMs are loaded through SGLang JIT from this
+package. No external MXFP4/INT8 torch extension is required or used.
 
 Convert the model first:
 
@@ -79,6 +77,7 @@ bash scripts/launch_dsv4_flash_int4_sglang.sh
 
 - `docs/design.md`: runtime architecture and patch scope.
 - `docs/mxfp4_int8_moe.md`: MXFP4/INT8 MoE design.
+- `docs/moe_operator_limitations.md`: why routed MoE does not saturate like dense GEMM.
 - `docs/model_conversion.md`: MXFP4 and INT4 conversion scripts.
 - `docs/sglang_version.md`: SGLang version and integration assumptions.
 - `docs/runtime_env.md`: launch environment variables.
