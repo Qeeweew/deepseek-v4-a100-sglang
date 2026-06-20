@@ -197,11 +197,6 @@ def _bf16_paged_mqa_logits_kernel(
                     mask=valid_l,
                     other=0,
                 ).to(tl.int64)
-                valid_page = valid_l & (page_ids >= 0) & (page_ids < k_pages)
-                safe_page_ids = tl.minimum(
-                    tl.maximum(page_ids, 0), tl.maximum(k_pages - 1, 0)
-                )
-
                 acc = tl.zeros((BLOCK_L, BLOCK_H), dtype=tl.float32)
                 for d_start in range(0, head_dim, BLOCK_D):
                     offs_d = d_start + tl.arange(0, BLOCK_D)
@@ -216,10 +211,10 @@ def _bf16_paged_mqa_logits_kernel(
                     )
                     k_vals = tl.load(
                         k_ptr
-                        + safe_page_ids[:, None] * k_stride_page
+                        + page_ids[:, None] * k_stride_page
                         + slot_offsets[:, None] * k_stride_block
                         + offs_d[None, :] * k_stride_d,
-                        mask=valid_page[:, None] & mask_d[None, :],
+                        mask=valid_l[:, None] & mask_d[None, :],
                         other=0.0,
                     )
                     acc += tl.dot(k_vals, q_vals, input_precision="tf32")
@@ -271,7 +266,7 @@ def bf16_paged_mqa_logits(
     ):
         return bf16_paged_mqa_logits_torch(
             q, kvcache_bf16, weight, seq_lens, page_table, deep_gemm_metadata, max_seq_len, clean_logits
-        )
+    )
 
     block_l = 256
     block_d = 64
@@ -308,6 +303,283 @@ def bf16_paged_mqa_logits(
         out.stride(1),
         BLOCK_L=block_l,
         BLOCK_D=block_d,
+        BLOCK_H=block_h,
+        NUM_WORKERS=num_workers,
+        NUM_BLOCK_ITERS=num_block_iters,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
+
+def int8_paged_mqa_logits_torch(
+    q: torch.Tensor,
+    kvcache_i8_with_scale: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    _ = deep_gemm_metadata, clean_logits
+    if seq_lens.ndim == 2:
+        seq_lens = seq_lens.squeeze(-1)
+    if weight.ndim == 3:
+        weight = weight.squeeze(-1)
+
+    batch_size, _, num_heads, head_dim = q.shape
+    block_size = 64
+    assert head_dim == 128
+    assert kvcache_i8_with_scale.dtype == torch.uint8
+    assert kvcache_i8_with_scale.shape[1] == block_size * (head_dim + 4)
+
+    num_pages = (max_seq_len + block_size - 1) // block_size
+    pages = page_table[:, :num_pages].to(torch.long)
+    gathered = kvcache_i8_with_scale[pages].contiguous()
+    values = gathered[..., : block_size * head_dim].view(torch.int8)
+    values = values.view(batch_size, num_pages * block_size, head_dim).float()
+    scales = gathered[..., block_size * head_dim :].contiguous().view(torch.float32)
+    scales = scales.view(batch_size, num_pages * block_size)
+
+    qv = q[:, 0].to(torch.int8).float()
+    scores = torch.einsum("bld,bhd->blh", values, qv)
+    scores = F.relu(scores)
+    logits = (scores * weight[:, None, :].float()).sum(dim=-1)
+    logits = logits * scales
+    logits = logits[:, :max_seq_len].contiguous()
+
+    pos = torch.arange(max_seq_len, device=logits.device).unsqueeze(0)
+    logits = logits.masked_fill(pos >= seq_lens.to(torch.long).unsqueeze(1), float("-inf"))
+    return logits
+
+
+def _sm_count(device: torch.device) -> int:
+    if device.type != "cuda":
+        return 108
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+_INT8_INDEXER_PAGE_SIZE = 64
+_INT8_INDEXER_HEAD_DIM = 128
+_INT8_INDEXER_HEADS = 64
+_INT8_INDEXER_BLOCK_D = 128
+_INT8_INDEXER_MAX_WORKERS_PER_BATCH = 256
+
+
+def _int8_paged_mqa_logits_config(
+    batch_size: int,
+    max_seq_len: int,
+    device: torch.device,
+) -> tuple[int, int, int, int, int]:
+    block_l = 256
+    num_seq_blocks = triton.cdiv(max(1, int(max_seq_len)), block_l)
+    total_tasks = batch_size * num_seq_blocks
+    per_batch_workers = min(
+        _INT8_INDEXER_MAX_WORKERS_PER_BATCH,
+        triton.next_power_of_2(max(1, num_seq_blocks)),
+    )
+    sm_count = _sm_count(device)
+    num_workers = triton.cdiv(batch_size * per_batch_workers, sm_count) * sm_count
+    num_workers = min(max(1, num_workers), max(1, total_tasks))
+    num_block_iters = triton.cdiv(total_tasks, num_workers)
+    return block_l, num_seq_blocks, num_workers, num_block_iters, total_tasks
+
+
+@triton.jit
+def _int8_paged_mqa_logits_kernel(
+    q_ptr,
+    k_ptr,
+    k_scale_ptr,
+    weight_ptr,
+    seq_lens_ptr,
+    page_table_ptr,
+    out_ptr,
+    max_seq_len: tl.constexpr,
+    batch_size: tl.constexpr,
+    num_seq_blocks: tl.constexpr,
+    k_pages: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    q_stride_b: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    k_stride_page: tl.constexpr,
+    k_scale_stride_page: tl.constexpr,
+    weight_stride_b: tl.constexpr,
+    weight_stride_h: tl.constexpr,
+    page_table_stride_b: tl.constexpr,
+    page_table_stride_p: tl.constexpr,
+    out_stride_b: tl.constexpr,
+    out_stride_l: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NUM_WORKERS: tl.constexpr,
+    NUM_BLOCK_ITERS: tl.constexpr,
+):
+    worker = tl.program_id(0)
+    offs_h = tl.arange(0, BLOCK_H)
+    mask_h = offs_h < num_heads
+    scale_offset = 64 * head_dim
+    scale_offset_f32 = scale_offset // 4
+
+    for block_iter in range(0, NUM_BLOCK_ITERS):
+        task = worker + block_iter * NUM_WORKERS
+        batch_id = task // num_seq_blocks
+        seq_block = task - batch_id * num_seq_blocks
+        tile_start = seq_block * BLOCK_L
+        if task < batch_size * num_seq_blocks:
+            seq_len = tl.load(seq_lens_ptr + batch_id).to(tl.int64)
+            offs_l = tile_start + tl.arange(0, BLOCK_L)
+            if tile_start < seq_len:
+                valid_l = (offs_l < max_seq_len) & (offs_l < seq_len)
+
+                page_offsets = offs_l // 64
+                slot_offsets = offs_l - page_offsets * 64
+                page_ids = tl.load(
+                    page_table_ptr
+                    + batch_id * page_table_stride_b
+                    + page_offsets * page_table_stride_p,
+                    mask=valid_l,
+                    other=0,
+                ).to(tl.int64)
+                acc = tl.zeros((BLOCK_L, BLOCK_H), dtype=tl.int32)
+                for d_start in range(0, head_dim, BLOCK_D):
+                    offs_d = d_start + tl.arange(0, BLOCK_D)
+                    mask_d = offs_d < head_dim
+                    q_vals = tl.load(
+                        q_ptr
+                        + batch_id * q_stride_b
+                        + offs_h[None, :] * q_stride_h
+                        + offs_d[:, None] * q_stride_d,
+                        mask=mask_h[None, :] & mask_d[:, None],
+                        other=0,
+                    )
+                    k_vals = tl.load(
+                        k_ptr
+                        + page_ids[:, None] * k_stride_page
+                        + slot_offsets[:, None] * head_dim
+                        + offs_d[None, :],
+                        mask=valid_l[:, None] & mask_d[None, :],
+                        other=0,
+                    ).to(tl.int8)
+                    acc += tl.dot(k_vals, q_vals, out_dtype=tl.int32)
+
+                acc_f = tl.maximum(acc, 0).to(tl.float32)
+                weights = tl.load(
+                    weight_ptr + batch_id * weight_stride_b + offs_h * weight_stride_h,
+                    mask=mask_h,
+                    other=0.0,
+                ).to(tl.float32)
+                logits = tl.sum(acc_f * weights[None, :], axis=1)
+                k_scale = tl.load(
+                    k_scale_ptr
+                    + page_ids * k_scale_stride_page
+                    + scale_offset_f32
+                    + slot_offsets,
+                    mask=valid_l,
+                    other=0.0,
+                ).to(tl.float32)
+                logits = logits * k_scale
+                logits = tl.where(valid_l, logits, float("-inf"))
+                tl.store(
+                    out_ptr + batch_id * out_stride_b + offs_l * out_stride_l,
+                    logits,
+                    mask=offs_l < max_seq_len,
+                )
+            else:
+                tl.store(
+                    out_ptr + batch_id * out_stride_b + offs_l * out_stride_l,
+                    tl.full((BLOCK_L,), float("-inf"), dtype=tl.float32),
+                    mask=offs_l < max_seq_len,
+                )
+
+
+def int8_paged_mqa_logits(
+    q: torch.Tensor,
+    kvcache_i8_with_scale: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    if q.device.type != "cuda":
+        return int8_paged_mqa_logits_torch(
+            q,
+            kvcache_i8_with_scale,
+            weight,
+            seq_lens,
+            page_table,
+            deep_gemm_metadata,
+            max_seq_len,
+            clean_logits,
+        )
+    if seq_lens.ndim == 2:
+        seq_lens = seq_lens.squeeze(-1)
+    if weight.ndim == 3:
+        weight = weight.squeeze(-1)
+
+    batch_size, _, num_heads, head_dim = q.shape
+    if (
+        head_dim != 128
+        or kvcache_i8_with_scale.dtype != torch.uint8
+        or kvcache_i8_with_scale.shape[1] != 64 * (head_dim + 4)
+    ):
+        return int8_paged_mqa_logits_torch(
+            q,
+            kvcache_i8_with_scale,
+            weight,
+            seq_lens,
+            page_table,
+            deep_gemm_metadata,
+            max_seq_len,
+            clean_logits,
+        )
+
+    launch_seq_len = max(1, int(max_seq_len))
+    block_l, num_seq_blocks, num_workers, num_block_iters, _ = _int8_paged_mqa_logits_config(
+        batch_size,
+        launch_seq_len,
+        q.device,
+    )
+    block_h = triton.next_power_of_2(num_heads)
+
+    out = torch.empty((batch_size, max_seq_len), dtype=torch.float32, device=q.device)
+    if clean_logits and launch_seq_len < max_seq_len:
+        out.fill_(float("-inf"))
+    seq_lens_arg = seq_lens.to(torch.int32) if seq_lens.dtype not in (torch.int32, torch.int64) else seq_lens
+    k_scale = kvcache_i8_with_scale.view(torch.float32)
+    grid = (num_workers,)
+    _int8_paged_mqa_logits_kernel[grid](
+        q,
+        kvcache_i8_with_scale,
+        k_scale,
+        weight,
+        seq_lens_arg,
+        page_table,
+        out,
+        int(launch_seq_len),
+        int(batch_size),
+        int(num_seq_blocks),
+        kvcache_i8_with_scale.shape[0],
+        int(num_heads),
+        int(head_dim),
+        q.stride(0),
+        q.stride(2),
+        q.stride(3),
+        kvcache_i8_with_scale.stride(0),
+        k_scale.stride(0),
+        weight.stride(0),
+        weight.stride(1),
+        page_table.stride(0),
+        page_table.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_L=block_l,
+        BLOCK_D=_INT8_INDEXER_BLOCK_D,
         BLOCK_H=block_h,
         NUM_WORKERS=num_workers,
         NUM_BLOCK_ITERS=num_block_iters,
@@ -421,3 +693,172 @@ def bf16_indexer_q(
         BLOCK=block,
     )
     return q, weights
+
+
+@triton.jit
+def _quantize_indexer_q_int8_kernel(
+    q_ptr,
+    weight_ptr,
+    q_out_ptr,
+    weights_out_ptr,
+    total_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    q_stride_b: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    weight_stride_b: tl.constexpr,
+    weight_stride_h: tl.constexpr,
+    q_out_stride_b: tl.constexpr,
+    q_out_stride_h: tl.constexpr,
+    q_out_stride_d: tl.constexpr,
+    weights_out_stride_b: tl.constexpr,
+    weights_out_stride_h: tl.constexpr,
+    weight_scale: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < head_dim
+    vals = tl.load(
+        q_ptr + b * q_stride_b + h * q_stride_h + offs_d * q_stride_d,
+        mask=mask_d,
+        other=0.0,
+    ).to(tl.float32)
+    abs_max = tl.max(tl.abs(vals), axis=0)
+    scale = tl.maximum(abs_max, 1.0e-8) / 127.0
+    q_i8 = tl.extra.libdevice.nearbyint(vals / scale)
+    q_i8 = tl.minimum(tl.maximum(q_i8, -127.0), 127.0).to(tl.int8)
+    tl.store(
+        q_out_ptr
+        + b * q_out_stride_b
+        + h * q_out_stride_h
+        + offs_d * q_out_stride_d,
+        q_i8,
+        mask=mask_d,
+    )
+    w = tl.load(weight_ptr + b * weight_stride_b + h * weight_stride_h).to(tl.float32)
+    tl.store(
+        weights_out_ptr + b * weights_out_stride_b + h * weights_out_stride_h,
+        w * scale * weight_scale,
+    )
+
+
+def int8_indexer_q_torch(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    q_out: torch.Tensor | None = None,
+    weights_out: torch.Tensor | None = None,
+    scratch_q: torch.Tensor | None = None,
+    allow_inplace_input: bool = False,
+    freqs_real: torch.Tensor | None = None,
+):
+    q_bf16, weights = bf16_indexer_q_torch(
+        q_input,
+        weight,
+        weight_scale,
+        freqs_cis,
+        positions,
+        q_out=scratch_q if scratch_q is not None and scratch_q.dtype == torch.bfloat16 else None,
+        weights_out=None,
+        scratch_q=scratch_q,
+        allow_inplace_input=allow_inplace_input,
+        freqs_real=freqs_real,
+    )
+    abs_max = q_bf16.float().abs().amax(dim=-1, keepdim=True)
+    scale = abs_max.clamp_min(1.0e-8) / 127.0
+    q_i8 = torch.round(q_bf16.float() / scale).clamp(-127, 127).to(torch.int8)
+    weights_i8 = weight.float() * float(weight_scale) * scale.squeeze(-1)
+    if q_out is not None:
+        q_out.copy_(q_i8)
+        q_i8 = q_out
+    if weights_out is not None:
+        if weights_out.ndim == 3:
+            weights_out.copy_(weights_i8.unsqueeze(-1))
+            weights_i8 = weights_out
+        else:
+            weights_out.copy_(weights_i8)
+            weights_i8 = weights_out
+    else:
+        weights_i8 = weights_i8.unsqueeze(-1)
+    return q_i8, weights_i8
+
+
+def int8_indexer_q(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    q_out: torch.Tensor | None = None,
+    weights_out: torch.Tensor | None = None,
+    scratch_q: torch.Tensor | None = None,
+    allow_inplace_input: bool = False,
+    freqs_real: torch.Tensor | None = None,
+):
+    if q_input.device.type != "cuda":
+        return int8_indexer_q_torch(
+            q_input,
+            weight,
+            weight_scale,
+            freqs_cis,
+            positions,
+            q_out=q_out,
+            weights_out=weights_out,
+            scratch_q=scratch_q,
+            allow_inplace_input=allow_inplace_input,
+            freqs_real=freqs_real,
+        )
+
+    from sglang.jit_kernel.hadamard import hadamard_transform
+
+    if allow_inplace_input and q_input.dtype == torch.bfloat16 and q_input.is_contiguous():
+        q = q_input
+    elif scratch_q is not None:
+        scratch_q.copy_(q_input)
+        q = scratch_q
+    else:
+        q = q_input.to(torch.bfloat16).contiguous().clone()
+    apply_rotary_tail_inplace(q, freqs_real if freqs_real is not None else freqs_cis, positions)
+    if scratch_q is not None and scratch_q.data_ptr() != q.data_ptr():
+        q = _hadamard_inplace_or_out(q, scratch_q)
+    else:
+        q = hadamard_transform(q, scale=q.shape[-1] ** -0.5)
+
+    q_i8 = (
+        q_out
+        if q_out is not None
+        else torch.empty(q.shape, device=q.device, dtype=torch.int8)
+    )
+    weights_shape = (*weight.shape, 1)
+    weights = (
+        weights_out
+        if weights_out is not None
+        else torch.empty(weights_shape, device=weight.device, dtype=torch.float32)
+    )
+    weights_2d = weights.squeeze(-1) if weights.ndim == 3 else weights
+    block_d = triton.next_power_of_2(q.shape[-1])
+    _quantize_indexer_q_int8_kernel[(q.shape[0], q.shape[1])](
+        q,
+        weight,
+        q_i8,
+        weights_2d,
+        q.shape[1],
+        q.shape[2],
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        weight.stride(0),
+        weight.stride(1),
+        q_i8.stride(0),
+        q_i8.stride(1),
+        q_i8.stride(2),
+        weights_2d.stride(0),
+        weights_2d.stride(1),
+        float(weight_scale),
+        BLOCK_D=block_d,
+    )
+    return q_i8, weights

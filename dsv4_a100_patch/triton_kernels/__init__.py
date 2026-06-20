@@ -27,6 +27,10 @@ from .indexer import (
     bf16_indexer_q_torch,
     bf16_paged_mqa_logits,
     bf16_paged_mqa_logits_torch,
+    int8_indexer_q,
+    int8_indexer_q_torch,
+    int8_paged_mqa_logits,
+    int8_paged_mqa_logits_torch,
 )
 from .kv_ops import (
     gather_bf16_kv,
@@ -34,6 +38,8 @@ from .kv_ops import (
     gather_bf16_kv_torch,
     scatter_bf16_rows,
     scatter_bf16_rows_torch,
+    scatter_int8_indexer_rows,
+    scatter_int8_indexer_rows_torch,
     trim_and_pad_rows,
     trim_and_pad_rows_torch,
 )
@@ -52,6 +58,10 @@ __all__ = [
     "bf16_paged_mqa_logits_torch",
     "bf16_indexer_q",
     "bf16_indexer_q_torch",
+    "int8_paged_mqa_logits",
+    "int8_paged_mqa_logits_torch",
+    "int8_indexer_q",
+    "int8_indexer_q_torch",
     "compressor_decode_mask_positions",
     "compressor_decode_mask_positions_torch",
     "compressor_prefill_metadata",
@@ -75,6 +85,8 @@ __all__ = [
     "remap_mxfp4_weight_for_int8",
     "scatter_bf16_rows",
     "scatter_bf16_rows_torch",
+    "scatter_int8_indexer_rows",
+    "scatter_int8_indexer_rows_torch",
     "trim_and_pad_rows",
     "trim_and_pad_rows_torch",
 ]

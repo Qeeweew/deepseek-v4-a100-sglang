@@ -8,6 +8,10 @@ from dsv4_a100_patch.triton_kernels import (
     bf16_indexer_q_torch,
     bf16_paged_mqa_logits,
     bf16_paged_mqa_logits_torch,
+    int8_indexer_q,
+    int8_indexer_q_torch,
+    int8_paged_mqa_logits,
+    int8_paged_mqa_logits_torch,
     compressor_decode_mask_positions,
     compressor_decode_mask_positions_torch,
     compressor_prefill_metadata,
@@ -25,6 +29,8 @@ from dsv4_a100_patch.triton_kernels import (
     prepare_mxfp4_moe_ogs,
     scatter_bf16_rows,
     scatter_bf16_rows_torch,
+    scatter_int8_indexer_rows,
+    scatter_int8_indexer_rows_torch,
     trim_and_pad_rows,
     trim_and_pad_rows_torch,
 )
@@ -1005,6 +1011,86 @@ def test_bf16_paged_mqa_logits_cuda_graph_replay_seq_len_growth():
     ref = bf16_paged_mqa_logits_torch(q, kv, weight, seq_lens, page_table, None, max_seq_len, False)
     torch.testing.assert_close(out[:, :1024], ref[:, :1024], atol=6e-1, rtol=6e-2)
     assert torch.isneginf(out[:, 1024:]).all()
+
+
+def test_int8_indexer_cache_store_matches_torch():
+    torch.manual_seed(48)
+    device = "cuda"
+    rows, head_dim, page_size = 257, 128, 64
+    pages = 8
+    src = torch.randn(rows, head_dim, device=device, dtype=torch.bfloat16)
+    loc = torch.randperm(pages * page_size, device=device, dtype=torch.int32)[:rows]
+    ref = torch.zeros((pages, page_size * (head_dim + 4)), device=device, dtype=torch.uint8)
+    tri = torch.zeros_like(ref)
+    scatter_int8_indexer_rows_torch(ref, loc, src)
+    scatter_int8_indexer_rows(tri, loc, src)
+    torch.cuda.synchronize()
+    ref_i8 = ref[:, : page_size * head_dim].view(torch.int8)
+    tri_i8 = tri[:, : page_size * head_dim].view(torch.int8)
+    diff = (ref_i8.to(torch.int16) - tri_i8.to(torch.int16)).abs()
+    assert diff.max().item() <= 1
+    torch.testing.assert_close(
+        tri[:, page_size * head_dim :].view(torch.float32),
+        ref[:, page_size * head_dim :].view(torch.float32),
+        atol=1e-7,
+        rtol=1e-6,
+    )
+
+
+def test_int8_indexer_q_per_head_scale_matches_torch():
+    torch.manual_seed(49)
+    device = "cuda"
+    tokens, heads, head_dim = 19, 64, 128
+    q = torch.randn(tokens, heads, head_dim, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(tokens, heads, device=device, dtype=torch.float32)
+    freqs = torch.zeros(256, 64, device=device, dtype=torch.float32)
+    freqs[:, 0::2] = 1.0
+    positions = torch.arange(tokens, device=device, dtype=torch.int32)
+    ref_q, ref_w = int8_indexer_q_torch(q.clone(), weight, 0.013, freqs, positions)
+    tri_q, tri_w = int8_indexer_q(q.clone(), weight, 0.013, freqs, positions)
+    torch.cuda.synchronize()
+    diff = (ref_q.to(torch.int16) - tri_q.to(torch.int16)).abs()
+    assert diff.max().item() <= 1
+    assert diff.float().mean().item() < 1e-2
+    torch.testing.assert_close(tri_w, ref_w, atol=1e-6, rtol=1e-5)
+
+
+def test_int8_paged_mqa_logits_accuracy_and_perf():
+    torch.manual_seed(50)
+    device = "cuda"
+    batch, heads, head_dim, max_seq_len = 16, 64, 128, 2048
+    block_size = 64
+    num_pages = max_seq_len // block_size
+    q_bf16 = torch.randn(batch, 1, heads, head_dim, device=device, dtype=torch.bfloat16)
+    kv_bf16 = torch.randn(num_pages, block_size, 1, head_dim, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(batch, heads, device=device, dtype=torch.float32) * 0.02
+    seq_lens = torch.randint(max_seq_len // 2, max_seq_len + 1, (batch,), device=device, dtype=torch.int32)
+    page_table = torch.arange(num_pages, device=device, dtype=torch.int32).expand(batch, num_pages).contiguous()
+
+    q_scale = q_bf16.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+    q_i8 = torch.round(q_bf16.float() / q_scale).clamp(-127, 127).to(torch.int8)
+    weight_i8 = weight * q_scale[:, 0, :, 0]
+    cache = torch.empty((num_pages, block_size * (head_dim + 4)), device=device, dtype=torch.uint8)
+    scatter_int8_indexer_rows(
+        cache,
+        torch.arange(num_pages * block_size, device=device, dtype=torch.int32),
+        kv_bf16.view(-1, head_dim),
+    )
+
+    ref = bf16_paged_mqa_logits(q_bf16, kv_bf16, weight, seq_lens, page_table, None, max_seq_len, False)
+    tri = int8_paged_mqa_logits(q_i8, cache, weight_i8, seq_lens, page_table, None, max_seq_len, False)
+    torch.cuda.synchronize()
+    finite = torch.isfinite(ref)
+    err = (tri[finite] - ref[finite]).abs()
+    assert err.mean().item() < 2e-2
+    row0 = finite[0]
+    assert torch.corrcoef(torch.stack([tri[0, row0].float(), ref[0, row0].float()]))[0, 1].item() > 0.999
+
+    ms = _bench(
+        lambda: int8_paged_mqa_logits(q_i8, cache, weight_i8, seq_lens, page_table, None, max_seq_len, False),
+        iters=10,
+    )
+    assert ms > 0
 
 
 def test_bf16_indexer_q_accuracy_and_perf():

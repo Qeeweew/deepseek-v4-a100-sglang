@@ -82,6 +82,104 @@ def scatter_bf16_rows(dst: torch.Tensor, loc: torch.Tensor, src: torch.Tensor) -
     )
 
 
+def scatter_int8_indexer_rows_torch(dst: torch.Tensor, loc: torch.Tensor, src: torch.Tensor) -> None:
+    head_dim = src.shape[-1]
+    page_size = 64
+    bytes_per_page = page_size * (head_dim + 4)
+    if dst.dtype != torch.uint8 or dst.shape[-1] != bytes_per_page:
+        raise ValueError(f"expected uint8 indexer cache with page bytes {bytes_per_page}")
+    flat_src = src.view(-1, head_dim).float()
+    loc_l = loc.to(torch.long)
+    valid = (loc_l >= 0) & (loc_l < dst.shape[0] * page_size)
+    if not valid.any():
+        return
+    loc_l = loc_l[valid]
+    flat_src = flat_src[valid]
+    page = loc_l // page_size
+    slot = loc_l % page_size
+    scale = flat_src.abs().amax(dim=-1).clamp_min(1.0e-8) / 127.0
+    q = torch.round(flat_src / scale[:, None]).clamp(-127, 127).to(torch.int8)
+    for i in range(q.shape[0]):
+        row = dst[page[i]]
+        row[slot[i] * head_dim : (slot[i] + 1) * head_dim] = q[i].view(torch.uint8)
+        scale_off = page_size * head_dim + slot[i] * 4
+        row[scale_off : scale_off + 4] = scale[i : i + 1].view(torch.uint8)
+
+
+@triton.jit
+def _scatter_int8_indexer_rows_kernel(
+    dst_ptr,
+    dst_f32_ptr,
+    loc_ptr,
+    src_ptr,
+    rows: tl.constexpr,
+    num_pages: tl.constexpr,
+    head_dim: tl.constexpr,
+    bytes_per_page: tl.constexpr,
+    floats_per_page: tl.constexpr,
+    page_size: tl.constexpr,
+    src_stride_row: tl.constexpr,
+    src_stride_dim: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row >= rows:
+        return
+    loc = tl.load(loc_ptr + row).to(tl.int64)
+    valid = (loc >= 0) & (loc < num_pages * page_size)
+    safe_loc = tl.minimum(tl.maximum(loc, 0), tl.maximum(num_pages * page_size - 1, 0))
+    page = safe_loc // page_size
+    slot = safe_loc - page * page_size
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < head_dim
+    vals = tl.load(
+        src_ptr + row * src_stride_row + offs_d * src_stride_dim,
+        mask=mask_d,
+        other=0.0,
+    ).to(tl.float32)
+    abs_max = tl.max(tl.abs(vals), axis=0)
+    scale = tl.maximum(abs_max, 1.0e-8) / 127.0
+    q = tl.extra.libdevice.nearbyint(vals / scale)
+    q = tl.minimum(tl.maximum(q, -127.0), 127.0).to(tl.int8)
+    value_offset = page * bytes_per_page + slot * head_dim + offs_d
+    tl.store(dst_ptr + value_offset, q, mask=valid & mask_d)
+    scale_offset = page * bytes_per_page + page_size * head_dim + slot * 4
+    scale_offset_f32 = page * floats_per_page + (page_size * head_dim) // 4 + slot
+    tl.store(dst_f32_ptr + scale_offset_f32, scale, mask=valid)
+
+
+def scatter_int8_indexer_rows(dst: torch.Tensor, loc: torch.Tensor, src: torch.Tensor) -> None:
+    if dst.device.type != "cuda" or src.device.type != "cuda":
+        scatter_int8_indexer_rows_torch(dst, loc, src)
+        return
+    head_dim = src.shape[-1]
+    page_size = 64
+    bytes_per_page = page_size * (head_dim + 4)
+    if dst.dtype != torch.uint8 or dst.shape[-1] != bytes_per_page:
+        raise ValueError(f"expected uint8 indexer cache with page bytes {bytes_per_page}")
+    rows = src.numel() // head_dim
+    if rows == 0:
+        return
+    flat_src = src.view(-1, head_dim)
+    dst_f32 = dst.view(torch.float32)
+    block_d = triton.next_power_of_2(head_dim)
+    _scatter_int8_indexer_rows_kernel[(rows,)](
+        dst,
+        dst_f32,
+        loc,
+        flat_src,
+        rows,
+        dst.shape[0],
+        head_dim,
+        bytes_per_page,
+        bytes_per_page // 4,
+        page_size,
+        flat_src.stride(0),
+        flat_src.stride(1),
+        BLOCK_D=block_d,
+    )
+
+
 def trim_and_pad_rows_torch(
     page_indices: torch.Tensor,
     lengths: torch.Tensor,

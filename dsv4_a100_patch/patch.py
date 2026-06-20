@@ -240,7 +240,11 @@ def _patch_dsv4_pool_configurator() -> None:
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         bf16_size = torch.bfloat16.itemsize
         kv_bytes = attn_head_dim * bf16_size
-        indexer_bytes = self.indexer_head_dim * bf16_size
+        indexer_bytes = (
+            self.indexer_head_dim + 4
+            if _env_enabled("SGLANG_DSV4_A100_INT8_INDEXER", "0")
+            else self.indexer_head_dim * bf16_size
+        )
 
         state_dtype_size = 4
         c4_state_bytes = 2 * 2 * attn_head_dim * state_dtype_size
@@ -277,7 +281,7 @@ def _patch_dsv4_pool_configurator() -> None:
 def _patch_deepseek_v4_bf16_kv_pool() -> None:
     from sglang.srt.mem_cache import deepseek_v4_memory_pool as dsv4_pool
     from sglang.srt.models import deepseek_v4 as deepseek_v4_model
-    from dsv4_a100_patch.triton_kernels import scatter_bf16_rows
+    from dsv4_a100_patch.triton_kernels import scatter_bf16_rows, scatter_int8_indexer_rows
 
     original_single_kv_pool = dsv4_pool.DeepSeekV4SingleKVPool
     original_indexer_pool = dsv4_pool.DeepSeekV4IndexerPool
@@ -310,7 +314,13 @@ def _patch_deepseek_v4_bf16_kv_pool() -> None:
 
     class BF16DeepSeekV4IndexerPool(original_indexer_pool):
         def _create_buffer(self):
-            page_elems = self.page_size * self.index_head_dim
+            use_int8_indexer = _env_enabled("SGLANG_DSV4_A100_INT8_INDEXER", "0")
+            page_elems = (
+                self.page_size * (self.index_head_dim + 4)
+                if use_int8_indexer
+                else self.page_size * self.index_head_dim
+            )
+            dtype = torch.uint8 if use_int8_indexer else torch.bfloat16
             with self.memory_saver_adapter.region(dsv4_pool.GPU_MEMORY_TYPE_KV_CACHE):
                 ctx = (
                     torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -322,7 +332,7 @@ def _patch_deepseek_v4_bf16_kv_pool() -> None:
                         torch.zeros(
                             (self.size + self.page_size + 1) // self.page_size,
                             page_elems,
-                            dtype=torch.bfloat16,
+                            dtype=dtype,
                             device=self.device,
                         )
                         for _ in range(self.layer_num)
@@ -343,18 +353,27 @@ def _patch_deepseek_v4_bf16_kv_pool() -> None:
             loc: torch.Tensor,
             cache_k: torch.Tensor,
         ) -> None:
-            with _record_function("bf16_indexer_cache_store"):
-                kv = cache_k.to(torch.bfloat16) if cache_k.dtype != torch.bfloat16 else cache_k
-                scatter_bf16_rows(
-                    self.index_k_with_scale_buffer[layer_id - self.start_layer],
-                    loc,
-                    kv.view(-1, self.index_head_dim),
-                )
+            with _record_function("indexer_cache_store"):
+                dst = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+                kv = cache_k.view(-1, self.index_head_dim)
+                if dst.dtype == torch.uint8:
+                    scatter_int8_indexer_rows(dst, loc, kv)
+                else:
+                    kv = kv.to(torch.bfloat16) if kv.dtype != torch.bfloat16 else kv
+                    scatter_bf16_rows(dst, loc, kv)
 
     class BF16DeepSeekV4TokenToKVPool(original_token_to_kv_pool):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            logger.warning("Monkey patch: DeepSeekV4TokenToKVPool using BF16 cache layout")
+            indexer_layout = (
+                "INT8 indexer"
+                if _env_enabled("SGLANG_DSV4_A100_INT8_INDEXER", "0")
+                else "BF16 indexer"
+            )
+            logger.warning(
+                "Monkey patch: DeepSeekV4TokenToKVPool using BF16 attention cache + %s cache layout",
+                indexer_layout,
+            )
 
         def set_swa_key_buffer_radix_fused_norm_rope(
             self,
@@ -566,7 +585,12 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
     import sglang.srt.layers.attention.dsv4.indexer as dsv4_indexer
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
     from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-    from dsv4_a100_patch.triton_kernels import bf16_indexer_q, bf16_paged_mqa_logits
+    from dsv4_a100_patch.triton_kernels import (
+        bf16_indexer_q,
+        bf16_paged_mqa_logits,
+        int8_indexer_q,
+        int8_paged_mqa_logits,
+    )
 
     def bf16_paged_mqa_logits_torch(
         q: torch.Tensor,
@@ -590,6 +614,28 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
                 clean_logits,
             )
 
+    def int8_paged_mqa_logits_torch(
+        q: torch.Tensor,
+        kvcache_int8: torch.Tensor,
+        weight: torch.Tensor,
+        seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        deep_gemm_metadata,
+        max_seq_len: int,
+        clean_logits: bool = True,
+    ) -> torch.Tensor:
+        with _record_function("c4_int8_paged_mqa_logits_triton"):
+            return int8_paged_mqa_logits(
+                q,
+                kvcache_int8,
+                weight,
+                seq_lens,
+                page_table,
+                deep_gemm_metadata,
+                max_seq_len,
+                clean_logits,
+            )
+
     def compute_q(
         self,
         q_lora: torch.Tensor,
@@ -602,16 +648,21 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
         freqs_real = getattr(self, "_dsv4_bf16_indexer_freqs_real", None)
         q_cache = _get_tensor_cache(self, "_dsv4_bf16_indexer_q_out_cache")
         weight_cache = _get_tensor_cache(self, "_dsv4_bf16_indexer_weights_out_cache")
-        q_key = (tuple(q.shape[1:]), _device_key(q.device))
+        use_int8_indexer = _env_enabled("SGLANG_DSV4_A100_INT8_INDEXER", "0")
+        q_key = (tuple(q.shape[1:]), _device_key(q.device), "int8" if use_int8_indexer else "bf16")
         w_shape = (*weight.shape, 1)
-        w_key = (tuple(w_shape[1:]), _device_key(weight.device))
+        w_key = (tuple(w_shape[1:]), _device_key(weight.device), "int8" if use_int8_indexer else "bf16")
         q_entry = q_cache.get(q_key)
         q_out = None if q_entry is None else q_entry["tensor"]
         if q_out is None or q_out.shape[0] < q.shape[0]:
             captured_tensors = [] if q_entry is None else q_entry.setdefault("captured_tensors", [])
             if q_out is not None and q_entry.get("captured", False):
                 captured_tensors.append(q_out)
-            q_out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
+            q_out = torch.empty(
+                q.shape,
+                device=q.device,
+                dtype=torch.int8 if use_int8_indexer else torch.bfloat16,
+            )
             q_cache[q_key] = {
                 "tensor": q_out,
                 "captured": _is_cuda_stream_capturing(),
@@ -636,7 +687,7 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
         if freqs_real is None or freqs_real.device != self.freqs_cis.device:
             freqs_real = torch.view_as_real(self.freqs_cis).flatten(-2).contiguous()
             self._dsv4_bf16_indexer_freqs_real = freqs_real
-        if _env_enabled("SGLANG_DSV4_A100_TORCH_INDEXER_Q", "0"):
+        if (not use_int8_indexer) and _env_enabled("SGLANG_DSV4_A100_TORCH_INDEXER_Q", "0"):
             with _record_function("c4_bf16_indexer_q_torch_fallback"):
                 return _bf16_indexer_q_torch_fallback(
                     q,
@@ -648,6 +699,19 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
                     weights_out=weights_out,
                     allow_inplace_input=True,
                 )
+        if use_int8_indexer:
+            return int8_indexer_q(
+                q,
+                weight,
+                self.weight_scale,
+                self.freqs_cis,
+                positions,
+                q_out=q_out,
+                weights_out=weights_out,
+                scratch_q=scratch_q,
+                allow_inplace_input=True,
+                freqs_real=freqs_real,
+            )
         return bf16_indexer_q(
             q,
             weight,
@@ -682,7 +746,7 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
 
         if enable_multi_stream:
-            q_bf16, weights, c4_indexer_kv_cache = self._forward_prepare_multi_stream(
+            q_indexer, weights, c4_indexer_kv_cache = self._forward_prepare_multi_stream(
                 x=x,
                 q_lora=q_lora,
                 c4_indexer=c4_indexer,
@@ -694,7 +758,7 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
             )
         else:
             assert q_lora_ready is None
-            q_bf16, weights, c4_indexer_kv_cache = self._forward_prepare_normal(
+            q_indexer, weights, c4_indexer_kv_cache = self._forward_prepare_normal(
                 x=x,
                 q_lora=q_lora,
                 c4_indexer=c4_indexer,
@@ -703,33 +767,45 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
                 token_to_kv_pool=token_to_kv_pool,
             )
 
-        assert len(q_bf16.shape) == 3
-        q_bf16 = q_bf16.unsqueeze(1)
+        assert len(q_indexer.shape) == 3
+        q_indexer = q_indexer.unsqueeze(1)
         assert len(c4_indexer_kv_cache.shape) == 2
-        assert c4_indexer_kv_cache.dtype == torch.bfloat16
-        with _record_function("c4_indexer_bf16_cache_view"):
-            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-                c4_indexer_kv_cache.shape[0],
-                64,
-                1,
-                c4_indexer.head_dim,
-            )
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         _c4sl = indexer_metadata.c4_seq_lens
         if _c4sl.dim() == 1:
             _c4sl = _c4sl.unsqueeze(-1)
-        logits = bf16_paged_mqa_logits_torch(
-            q_bf16,
-            c4_indexer_kv_cache,
-            weights,
-            _c4sl,
-            indexer_metadata.page_table,
-            indexer_metadata.deep_gemm_metadata,
-            indexer_metadata.max_c4_seq_len,
-            False,
-        )
+        if c4_indexer_kv_cache.dtype == torch.uint8:
+            logits = int8_paged_mqa_logits_torch(
+                q_indexer,
+                c4_indexer_kv_cache,
+                weights,
+                _c4sl,
+                indexer_metadata.page_table,
+                indexer_metadata.deep_gemm_metadata,
+                indexer_metadata.max_c4_seq_len,
+                False,
+            )
+        else:
+            assert c4_indexer_kv_cache.dtype == torch.bfloat16
+            with _record_function("c4_indexer_bf16_cache_view"):
+                c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                    c4_indexer_kv_cache.shape[0],
+                    64,
+                    1,
+                    c4_indexer.head_dim,
+                )
+            logits = bf16_paged_mqa_logits_torch(
+                q_indexer,
+                c4_indexer_kv_cache,
+                weights,
+                _c4sl,
+                indexer_metadata.page_table,
+                indexer_metadata.deep_gemm_metadata,
+                indexer_metadata.max_c4_seq_len,
+                False,
+            )
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
