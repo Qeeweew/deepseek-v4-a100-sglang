@@ -18,6 +18,9 @@ def _bucket_total_tokens(total_tokens: int) -> int:
 
 @triton.autotune(
     configs=[
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
@@ -39,9 +42,6 @@ def _direct_sparse_attention_kernel(
     total_tokens,
     total_tokens_bucket,
     h_q,
-    total_topk,
-    d_qk,
-    d_v,
     stride_q_t,
     stride_q_h,
     stride_q_d,
@@ -55,6 +55,10 @@ def _direct_sparse_attention_kernel(
     stride_lse_t,
     stride_lse_h,
     HAS_ATTN_SINK: tl.constexpr,
+    STORE_LSE: tl.constexpr,
+    total_topk: tl.constexpr,
+    d_qk: tl.constexpr,
+    d_v: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -180,7 +184,6 @@ def _direct_sparse_attention_kernel(
             m_i = m_new
             l_i = l_new
 
-    lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
     is_lonely_q = l_i == 0.0
 
     if HAS_ATTN_SINK:
@@ -201,10 +204,15 @@ def _direct_sparse_attention_kernel(
         acc_2 = tl.where(is_lonely_q_2d, 0.0, acc_2 * output_scale_2d)
     if NUM_V_BLOCKS > 3:
         acc_3 = tl.where(is_lonely_q_2d, 0.0, acc_3 * output_scale_2d)
-    lse = tl.where(is_lonely_q, POS_INF, lse)
-
-    stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
-    tl.store(LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h, lse, mask=mask_h)
+    if STORE_LSE:
+        if HAS_ATTN_SINK:
+            lse = m_i + tl.math.log2(denominator) / LOG2E
+            lse = tl.where(is_lonely_q, attn_sink_vals, lse)
+        else:
+            lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
+            lse = tl.where(is_lonely_q, POS_INF, lse)
+        stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
+        tl.store(LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h, lse, mask=mask_h)
 
     stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
     o_base = Output + pid_t_64 * stride_o_t_64
@@ -250,6 +258,7 @@ def direct_sparse_attention(
     attn_sink: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
+    store_lse: bool = True,
 ):
     total_tokens, h_q, d_qk = q.shape
     d_v = buffer.shape[-1]
@@ -278,9 +287,6 @@ def direct_sparse_attention(
         total_tokens,
         _bucket_total_tokens(total_tokens),
         h_q,
-        total_topk,
-        d_qk,
-        d_v,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -294,27 +300,20 @@ def direct_sparse_attention(
         lse.stride(0),
         lse.stride(1),
         HAS_ATTN_SINK=has_attn_sink,
+        STORE_LSE=store_lse,
+        total_topk=total_topk,
+        d_qk=d_qk,
+        d_v=d_v,
         NUM_QK_BLOCKS=num_qk_blocks,
         NUM_V_BLOCKS=num_v_blocks,
     )
     return output, lse
-
-
 
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "total_topk", "d_qk"],
 )
@@ -336,10 +335,6 @@ def _direct_dual_sparse_attention_kernel(
     total_tokens,
     total_tokens_bucket,
     h_q,
-    primary_topk,
-    total_topk,
-    d_qk,
-    d_v,
     stride_q_t,
     stride_q_h,
     stride_q_d,
@@ -357,6 +352,11 @@ def _direct_dual_sparse_attention_kernel(
     stride_lse_t,
     stride_lse_h,
     HAS_ATTN_SINK: tl.constexpr,
+    STORE_LSE: tl.constexpr,
+    primary_topk: tl.constexpr,
+    total_topk: tl.constexpr,
+    d_qk: tl.constexpr,
+    d_v: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -509,7 +509,6 @@ def _direct_dual_sparse_attention_kernel(
                 m_i = m_new
                 l_i = l_new
 
-    lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
     is_lonely_q = l_i == 0.0
 
     if HAS_ATTN_SINK:
@@ -530,10 +529,15 @@ def _direct_dual_sparse_attention_kernel(
         acc_2 = tl.where(is_lonely_q_2d, 0.0, acc_2 * output_scale_2d)
     if NUM_V_BLOCKS > 3:
         acc_3 = tl.where(is_lonely_q_2d, 0.0, acc_3 * output_scale_2d)
-    lse = tl.where(is_lonely_q, POS_INF, lse)
-
-    stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
-    tl.store(LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h, lse, mask=mask_h)
+    if STORE_LSE:
+        if HAS_ATTN_SINK:
+            lse = m_i + tl.math.log2(denominator) / LOG2E
+            lse = tl.where(is_lonely_q, attn_sink_vals, lse)
+        else:
+            lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
+            lse = tl.where(is_lonely_q, POS_INF, lse)
+        stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
+        tl.store(LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h, lse, mask=mask_h)
 
     stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
     o_base = Output + pid_t_64 * stride_o_t_64
@@ -556,8 +560,6 @@ def _direct_dual_sparse_attention_kernel(
         tl.store(o_base + offs_h_2d * stride_o_h + offs_v_3[None, :] * stride_o_d, acc_3.to(tl.bfloat16), mask=mask_h_2d & (offs_v_3[None, :] < d_v))
 
 
-
-
 def direct_dual_sparse_attention(
     q: torch.Tensor,
     primary_buffer: torch.Tensor,
@@ -570,6 +572,7 @@ def direct_dual_sparse_attention(
     attn_sink: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
+    store_lse: bool = True,
 ):
     total_tokens, h_q, d_qk = q.shape
     d_v = primary_buffer.shape[-1]
@@ -606,10 +609,6 @@ def direct_dual_sparse_attention(
         total_tokens,
         _bucket_total_tokens(total_tokens),
         h_q,
-        primary_topk,
-        total_topk,
-        d_qk,
-        d_v,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -627,6 +626,11 @@ def direct_dual_sparse_attention(
         lse.stride(0),
         lse.stride(1),
         HAS_ATTN_SINK=has_attn_sink,
+        STORE_LSE=store_lse,
+        primary_topk=primary_topk,
+        total_topk=total_topk,
+        d_qk=d_qk,
+        d_v=d_v,
         NUM_QK_BLOCKS=num_qk_blocks,
         NUM_V_BLOCKS=num_v_blocks,
     )

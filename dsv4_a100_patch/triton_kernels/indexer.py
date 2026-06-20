@@ -159,6 +159,7 @@ def _bf16_paged_mqa_logits_kernel(
     q_stride_b: tl.constexpr,
     q_stride_h: tl.constexpr,
     q_stride_d: tl.constexpr,
+    seq_lens_stride_b: tl.constexpr,
     k_stride_page: tl.constexpr,
     k_stride_block: tl.constexpr,
     k_stride_d: tl.constexpr,
@@ -176,7 +177,7 @@ def _bf16_paged_mqa_logits_kernel(
 ):
     b = tl.program_id(0)
     worker = tl.program_id(1)
-    seq_len = tl.load(seq_lens_ptr + b).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + b * seq_lens_stride_b).to(tl.int64)
     offs_h = tl.arange(0, BLOCK_H)
     mask_h = offs_h < num_heads
 
@@ -297,6 +298,7 @@ def bf16_paged_mqa_logits(
         q.stride(0),
         q.stride(2),
         q.stride(3),
+        seq_lens_arg.stride(0),
         kvcache_bf16.stride(0),
         kvcache_bf16.stride(1),
         kvcache_bf16.stride(3),

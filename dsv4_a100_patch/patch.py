@@ -228,6 +228,13 @@ def _patch_deepseek_v4_hook() -> None:
             server_args.swa_full_tokens_ratio = 0.1
         if server_args.speculative_algorithm is not None and not envs.SGLANG_ENABLE_SPEC_V2.get():
             envs.SGLANG_ENABLE_SPEC_V2.set(True)
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Monkey patch: disabling overlap schedule for %s. "
+            "The patched BF16 sparse-attention path currently requires this "
+            "to avoid 128K prefill release-time CUDA illegal memory access.",
+            model_arch,
+        )
 
     deepseek_v4_hook.apply_deepseek_v4_defaults = apply_deepseek_v4_defaults
 
@@ -1003,6 +1010,7 @@ def _prepare_sparse_metadata(
 
 def _patch_deepseek_v4_backend() -> None:
     from sglang.srt.layers.attention import deepseek_v4_backend as dsv4_backend
+    from sglang.srt.layers.dp_attention import get_attention_tp_rank
     from dsv4_a100_patch.triton_kernels import (
         direct_dual_sparse_attention,
         direct_sparse_attention,
@@ -1045,31 +1053,6 @@ def _patch_deepseek_v4_backend() -> None:
             "captured_tensors": captured_tensors,
         }
         return gathered, invalid_mask
-
-    def _get_reusable_attention_outputs(
-        self,
-        q_tokens: int,
-        q_heads: int,
-        head_dim: int,
-        device: torch.device,
-    ):
-        cache = _get_tensor_cache(self, "_dsv4_attention_outputs")
-        needed = (q_heads, head_dim, _device_key(device))
-        cached = cache.get(needed)
-        if cached is not None and cached["output"].shape[0] >= q_tokens:
-            return cached["output"][:q_tokens], cached["lse"][:q_tokens]
-        captured_tensors = [] if cached is None else cached.setdefault("captured_tensors", [])
-        if cached is not None and cached.get("captured", False):
-            captured_tensors.extend([cached["output"], cached["lse"]])
-        output = torch.empty((q_tokens, q_heads, head_dim), dtype=torch.bfloat16, device=device)
-        lse = torch.empty((q_tokens, q_heads), dtype=torch.float32, device=device)
-        cache[needed] = {
-            "output": output,
-            "lse": lse,
-            "captured": _is_cuda_stream_capturing(),
-            "captured_tensors": captured_tensors,
-        }
-        return output, lse
 
     def _get_reusable_lse_buffer(
         self,
@@ -1163,26 +1146,57 @@ def _patch_deepseek_v4_backend() -> None:
                     total_topk = swa_topk + extra_idx.shape[-1]
 
             qk_head_dim = q3.shape[-1]
-            q_head_num = q3.shape[1]
+            local_q_head_num = getattr(layer, "tp_q_head_num", q3.shape[1])
+            if q3.shape[1] < local_q_head_num:
+                raise RuntimeError(
+                    f"q has fewer heads than layer.tp_q_head_num: {q3.shape[1]} < {local_q_head_num}"
+                )
+            attn_head_start = (
+                get_attention_tp_rank() * local_q_head_num
+                if attn_sink is not None and attn_sink.numel() > local_q_head_num
+                else 0
+            )
+            if q3.shape[1] == local_q_head_num:
+                head_start = 0
+                q_kernel = q3
+                return_full_head_output = False
+            else:
+                head_start = attn_head_start
+                head_end = head_start + local_q_head_num
+                if head_end > q3.shape[1]:
+                    raise RuntimeError(
+                        f"invalid TP head slice [{head_start}:{head_end}] for q heads {q3.shape[1]}"
+                    )
+                q_kernel = q3[:, head_start:head_end, :]
+                return_full_head_output = True
+            attn_sink_kernel = attn_sink
+            if attn_sink is not None and attn_sink.numel() != local_q_head_num:
+                attn_head_end = attn_head_start + local_q_head_num
+                if attn_head_end > attn_sink.numel():
+                    raise RuntimeError(
+                        f"invalid TP attn_sink slice [{attn_head_start}:{attn_head_end}] "
+                        f"for attn_sink size {attn_sink.numel()}"
+                    )
+                attn_sink_kernel = attn_sink[attn_head_start:attn_head_end]
             if _env_enabled("SGLANG_DSV4_A100_DIRECT_ATTENTION", "1"):
                 with _record_function("dsv4_bf16_attention_direct_triton"):
                     lse_buf = _get_reusable_lse_buffer(
-                        self, q_tokens, q_head_num, q3.device
+                        self, q_tokens, local_q_head_num, q_kernel.device
                     )
-                    q3_contig = q3.contiguous()
                     if extra_idx is None:
                         out, _lse = direct_sparse_attention(
-                            q3_contig,
+                            q_kernel,
                             swa_buf,
                             swa_idx,
                             swa_len,
                             self.softmax_scale,
-                            attn_sink=attn_sink,
+                            attn_sink=attn_sink_kernel,
                             lse=lse_buf,
+                            store_lse=False,
                         )
                     else:
                         out, _lse = direct_dual_sparse_attention(
-                            q3_contig,
+                            q_kernel,
                             swa_buf,
                             swa_idx,
                             swa_len,
@@ -1190,14 +1204,18 @@ def _patch_deepseek_v4_backend() -> None:
                             extra_idx,
                             extra_len,
                             self.softmax_scale,
-                            attn_sink=attn_sink,
+                            attn_sink=attn_sink_kernel,
                             lse=lse_buf,
+                            store_lse=False,
                         )
+                    if return_full_head_output:
+                        q3[:, head_start : head_start + local_q_head_num, :].copy_(out)
+                        out = q3
                 return out
 
             with _record_function("dsv4_bf16_attention_gather_triton"):
                 gathered, invalid_mask = _get_reusable_sparse_buffers(
-                    self, q_tokens, total_topk, head_dim, q3.device
+                    self, q_tokens, total_topk, head_dim, q_kernel.device
                 )
                 if _env_enabled("SGLANG_DSV4_A100_TORCH_GATHER", "0"):
                     with _record_function("dsv4_bf16_attention_gather_torch"):
@@ -1236,17 +1254,20 @@ def _patch_deepseek_v4_backend() -> None:
 
             with _record_function("dsv4_bf16_attention_run_unified_attention"):
                 out, _lse = run_unified_attention(
-                    q3.contiguous(),
+                    q_kernel.contiguous(),
                     gathered.contiguous(),
                     invalid_mask.contiguous(),
                     qk_head_dim,
                     self.softmax_scale,
                     q_tokens,
-                    q_head_num,
+                    local_q_head_num,
                     total_topk,
                     qk_head_dim,
-                    attn_sink=attn_sink,
+                    attn_sink=attn_sink_kernel,
                 )
+                if return_full_head_output:
+                    q3[:, head_start : head_start + local_q_head_num, :].copy_(out)
+                    out = q3
             return out
 
     dsv4_backend.DeepseekV4AttnBackend.forward = forward
