@@ -565,6 +565,11 @@ def _patch_fused_rope_inplace() -> None:
 
 def _patch_dsv4_indexer_torch_fallback() -> None:
     from sglang.srt.environ import envs
+    from sglang.srt.layers.dp_attention import (
+        get_attention_tp_group,
+        get_attention_tp_rank,
+        get_attention_tp_size,
+    )
     import sglang.srt.layers.attention.dsv4.indexer as dsv4_indexer
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
     from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
