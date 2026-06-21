@@ -35,7 +35,7 @@ bash scripts/launch_dsv4_flash_int4_sglang.sh
   conservative torch fallback is required.
 - `SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1`: avoids the unsupported FP8 paged MQA
   logits path.
-- `SGLANG_DSV4_INDEXER_QUERY_CP_PREFILL=0`: optional C4 indexer query-token
+- `SGLANG_DSV4_INDEXER_QUERY_CP_PREFILL=1`: optional C4 indexer query-token
   parallelism for prefill.
 
 ## Notes
