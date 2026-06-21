@@ -1032,6 +1032,10 @@ def _prepare_sparse_metadata(
 
 def _patch_deepseek_v4_backend() -> None:
     from sglang.srt.layers.attention import deepseek_v4_backend as dsv4_backend
+    from sglang.srt.layers.dp_attention import (
+        get_attention_tp_rank,
+        get_attention_tp_size,
+    )
     from dsv4_a100_patch.triton_kernels import (
         direct_dual_sparse_attention,
         direct_sparse_attention,
@@ -1116,12 +1120,32 @@ def _patch_deepseek_v4_backend() -> None:
             q_head_num = q3.shape[1]
             if _env_enabled("SGLANG_DSV4_A100_DIRECT_ATTENTION", "1"):
                 with _record_function("dsv4_bf16_attention_direct_triton"):
+                    q_for_attn = q3
+                    attn_sink_for_attn = attn_sink
+                    full_out = None
+                    if q_head_num != layer.tp_q_head_num:
+                        attn_tp_size = get_attention_tp_size()
+                        attn_tp_rank = get_attention_tp_rank()
+                        local_heads = layer.tp_q_head_num
+                        head_start = attn_tp_rank * local_heads
+                        head_end = head_start + local_heads
+                        assert q_head_num == local_heads * attn_tp_size, (
+                            f"unexpected padded q heads: {q_head_num=} "
+                            f"{local_heads=} {attn_tp_size=}"
+                        )
+                        q_for_attn = q3[:, head_start:head_end, :]
+                        if attn_sink is not None:
+                            attn_sink_for_attn = attn_sink[head_start:head_end]
+                        full_out = q.new_empty(q3.shape[0], q_head_num, layer.v_head_dim)
+                        out_view = full_out[:, head_start:head_end, :]
+                    else:
+                        out_view = None
                     lse_buf = torch.empty(
-                        (q_tokens, q_head_num),
+                        (q_tokens, q_for_attn.shape[1]),
                         dtype=torch.float32,
                         device=q3.device,
                     )
-                    q3_contig = q3.contiguous()
+                    q3_contig = q_for_attn.contiguous()
                     if extra_idx is None:
                         out, _lse = direct_sparse_attention(
                             q3_contig,
@@ -1129,7 +1153,8 @@ def _patch_deepseek_v4_backend() -> None:
                             swa_idx,
                             swa_len,
                             self.softmax_scale,
-                            attn_sink=attn_sink,
+                            attn_sink=attn_sink_for_attn,
+                            output=out_view,
                             lse=lse_buf,
                         )
                     else:
@@ -1142,9 +1167,12 @@ def _patch_deepseek_v4_backend() -> None:
                             extra_idx,
                             extra_len,
                             self.softmax_scale,
-                            attn_sink=attn_sink,
+                            attn_sink=attn_sink_for_attn,
+                            output=out_view,
                             lse=lse_buf,
                         )
+                    if full_out is not None:
+                        out = full_out
                 return out
 
             with _record_function("dsv4_bf16_attention_gather_triton"):

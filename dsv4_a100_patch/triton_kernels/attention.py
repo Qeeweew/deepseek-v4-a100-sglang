@@ -8,12 +8,30 @@ LOG2E = tl.constexpr(1.4426950408889634)
 
 
 def _bucket_total_tokens(total_tokens: int) -> int:
-    if total_tokens <= 0:
+    if total_tokens <= 16:
+        return 16
+    if total_tokens <= 128:
+        return 128
+    if total_tokens <= 1024:
+        return 1024
+    return 8192
+
+
+def _next_power_of_2(value: int) -> int:
+    if value <= 1:
         return 1
-    n = 1
-    while n < total_tokens:
-        n <<= 1
-    return n
+    return 1 << (value - 1).bit_length()
+
+
+def _prune_attention_configs(configs, named_args, **kwargs):
+    h_q = int(named_args.get("h_q", kwargs.get("h_q", 0)))
+    max_block_h = max(16, _next_power_of_2(h_q))
+    pruned = [
+        config
+        for config in configs
+        if config.kwargs.get("BLOCK_H", 16) <= max_block_h
+    ]
+    return pruned or configs[:1]
 
 
 @triton.autotune(
@@ -24,6 +42,7 @@ def _bucket_total_tokens(total_tokens: int) -> int:
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "total_topk", "d_qk"],
+    prune_configs_by={"early_config_prune": _prune_attention_configs},
 )
 @triton.jit
 def _direct_sparse_attention_kernel(
@@ -316,7 +335,8 @@ def direct_sparse_attention(
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
     ],
-    key=["total_tokens_bucket", "h_q", "total_topk", "d_qk"],
+    key=["total_tokens_bucket", "h_q", "primary_topk", "total_topk", "d_qk"],
+    prune_configs_by={"early_config_prune": _prune_attention_configs},
 )
 @triton.jit
 def _direct_dual_sparse_attention_kernel(
