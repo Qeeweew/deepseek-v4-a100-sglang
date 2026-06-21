@@ -24,14 +24,6 @@ def _device_key(device: torch.device) -> int:
     return device.index if device.type == "cuda" else -1
 
 
-def _get_tensor_cache(obj, attr: str) -> dict:
-    cache = getattr(obj, attr, None)
-    if cache is None:
-        cache = {}
-        setattr(obj, attr, cache)
-    return cache
-
-
 def _can_sync_cuda() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -39,15 +31,6 @@ def _can_sync_cuda() -> bool:
         return not torch.cuda.is_current_stream_capturing()
     except Exception:
         return True
-
-
-def _is_cuda_stream_capturing() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    try:
-        return torch.cuda.is_current_stream_capturing()
-    except Exception:
-        return False
 
 
 @contextlib.contextmanager
@@ -646,44 +629,14 @@ def _patch_dsv4_indexer_torch_fallback() -> None:
         q = q.view(-1, self.n_local_heads, self.head_dim)
         scratch_q = getattr(self, "_dsv4_bf16_indexer_scratch_q", None)
         freqs_real = getattr(self, "_dsv4_bf16_indexer_freqs_real", None)
-        q_cache = _get_tensor_cache(self, "_dsv4_bf16_indexer_q_out_cache")
-        weight_cache = _get_tensor_cache(self, "_dsv4_bf16_indexer_weights_out_cache")
         use_int8_indexer = _env_enabled("SGLANG_DSV4_A100_INT8_INDEXER", "0")
-        q_key = (tuple(q.shape[1:]), _device_key(q.device), "int8" if use_int8_indexer else "bf16")
         w_shape = (*weight.shape, 1)
-        w_key = (tuple(w_shape[1:]), _device_key(weight.device), "int8" if use_int8_indexer else "bf16")
-        q_entry = q_cache.get(q_key)
-        q_out = None if q_entry is None else q_entry["tensor"]
-        if q_out is None or q_out.shape[0] < q.shape[0]:
-            captured_tensors = [] if q_entry is None else q_entry.setdefault("captured_tensors", [])
-            if q_out is not None and q_entry.get("captured", False):
-                captured_tensors.append(q_out)
-            q_out = torch.empty(
-                q.shape,
-                device=q.device,
-                dtype=torch.int8 if use_int8_indexer else torch.bfloat16,
-            )
-            q_cache[q_key] = {
-                "tensor": q_out,
-                "captured": _is_cuda_stream_capturing(),
-                "captured_tensors": captured_tensors,
-            }
-        else:
-            q_out = q_out[: q.shape[0]]
-        w_entry = weight_cache.get(w_key)
-        weights_out = None if w_entry is None else w_entry["tensor"]
-        if weights_out is None or weights_out.shape[0] < w_shape[0]:
-            captured_tensors = [] if w_entry is None else w_entry.setdefault("captured_tensors", [])
-            if weights_out is not None and w_entry.get("captured", False):
-                captured_tensors.append(weights_out)
-            weights_out = torch.empty(w_shape, device=weight.device, dtype=torch.float32)
-            weight_cache[w_key] = {
-                "tensor": weights_out,
-                "captured": _is_cuda_stream_capturing(),
-                "captured_tensors": captured_tensors,
-            }
-        else:
-            weights_out = weights_out[: w_shape[0]]
+        q_out = torch.empty(
+            q.shape,
+            device=q.device,
+            dtype=torch.int8 if use_int8_indexer else torch.bfloat16,
+        )
+        weights_out = torch.empty(w_shape, device=weight.device, dtype=torch.float32)
         if freqs_real is None or freqs_real.device != self.freqs_cis.device:
             freqs_real = torch.view_as_real(self.freqs_cis).flatten(-2).contiguous()
             self._dsv4_bf16_indexer_freqs_real = freqs_real
@@ -1090,85 +1043,6 @@ def _patch_deepseek_v4_backend() -> None:
     _pad_tensor_to_size = dsv4_backend._pad_tensor_to_size
     run_unified_attention = _TRITON_COMMON.run_unified_attention
 
-    def _get_reusable_sparse_buffers(
-        self,
-        q_tokens: int,
-        total_topk: int,
-        head_dim: int,
-        device: torch.device,
-    ):
-        cache = _get_tensor_cache(self, "_dsv4_sparse_buffers")
-        needed = (head_dim, _device_key(device))
-        cached = cache.get(needed)
-        if (
-            cached is not None
-            and cached["gathered"].shape[0] >= q_tokens
-            and cached["gathered"].shape[1] >= total_topk
-        ):
-            return (
-                cached["gathered"][:q_tokens, :total_topk, :],
-                cached["invalid_mask"][:q_tokens, :total_topk],
-            )
-        captured_tensors = [] if cached is None else cached.setdefault("captured_tensors", [])
-        if cached is not None and cached.get("captured", False):
-            captured_tensors.extend([cached["gathered"], cached["invalid_mask"]])
-        gathered = torch.empty((q_tokens, total_topk, head_dim), dtype=torch.bfloat16, device=device)
-        invalid_mask = torch.empty((q_tokens, total_topk), dtype=torch.bool, device=device)
-        cache[needed] = {
-            "gathered": gathered,
-            "invalid_mask": invalid_mask,
-            "captured": _is_cuda_stream_capturing(),
-            "captured_tensors": captured_tensors,
-        }
-        return gathered, invalid_mask
-
-    def _get_reusable_attention_outputs(
-        self,
-        q_tokens: int,
-        q_heads: int,
-        head_dim: int,
-        device: torch.device,
-    ):
-        cache = _get_tensor_cache(self, "_dsv4_attention_outputs")
-        needed = (q_heads, head_dim, _device_key(device))
-        cached = cache.get(needed)
-        if cached is not None and cached["output"].shape[0] >= q_tokens:
-            return cached["output"][:q_tokens], cached["lse"][:q_tokens]
-        captured_tensors = [] if cached is None else cached.setdefault("captured_tensors", [])
-        if cached is not None and cached.get("captured", False):
-            captured_tensors.extend([cached["output"], cached["lse"]])
-        output = torch.empty((q_tokens, q_heads, head_dim), dtype=torch.bfloat16, device=device)
-        lse = torch.empty((q_tokens, q_heads), dtype=torch.float32, device=device)
-        cache[needed] = {
-            "output": output,
-            "lse": lse,
-            "captured": _is_cuda_stream_capturing(),
-            "captured_tensors": captured_tensors,
-        }
-        return output, lse
-
-    def _get_reusable_lse_buffer(
-        self,
-        q_tokens: int,
-        q_heads: int,
-        device: torch.device,
-    ):
-        cache = _get_tensor_cache(self, "_dsv4_attention_lse_buffers")
-        needed = (q_heads, _device_key(device))
-        cached = cache.get(needed)
-        if cached is not None and cached["lse"].shape[0] >= q_tokens:
-            return cached["lse"][:q_tokens]
-        captured_tensors = [] if cached is None else cached.setdefault("captured_tensors", [])
-        if cached is not None and cached.get("captured", False):
-            captured_tensors.append(cached["lse"])
-        lse = torch.empty((q_tokens, q_heads), dtype=torch.float32, device=device)
-        cache[needed] = {
-            "lse": lse,
-            "captured": _is_cuda_stream_capturing(),
-            "captured_tensors": captured_tensors,
-        }
-        return lse
-
     def forward(
         self,
         q: torch.Tensor,
@@ -1242,8 +1116,10 @@ def _patch_deepseek_v4_backend() -> None:
             q_head_num = q3.shape[1]
             if _env_enabled("SGLANG_DSV4_A100_DIRECT_ATTENTION", "1"):
                 with _record_function("dsv4_bf16_attention_direct_triton"):
-                    lse_buf = _get_reusable_lse_buffer(
-                        self, q_tokens, q_head_num, q3.device
+                    lse_buf = torch.empty(
+                        (q_tokens, q_head_num),
+                        dtype=torch.float32,
+                        device=q3.device,
                     )
                     q3_contig = q3.contiguous()
                     if extra_idx is None:
@@ -1272,8 +1148,15 @@ def _patch_deepseek_v4_backend() -> None:
                 return out
 
             with _record_function("dsv4_bf16_attention_gather_triton"):
-                gathered, invalid_mask = _get_reusable_sparse_buffers(
-                    self, q_tokens, total_topk, head_dim, q3.device
+                gathered = torch.empty(
+                    (q_tokens, total_topk, head_dim),
+                    dtype=torch.bfloat16,
+                    device=q3.device,
+                )
+                invalid_mask = torch.empty(
+                    (q_tokens, total_topk),
+                    dtype=torch.bool,
+                    device=q3.device,
                 )
                 if _env_enabled("SGLANG_DSV4_A100_TORCH_GATHER", "0"):
                     with _record_function("dsv4_bf16_attention_gather_torch"):
