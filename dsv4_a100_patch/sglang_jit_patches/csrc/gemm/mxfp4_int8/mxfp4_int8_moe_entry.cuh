@@ -131,9 +131,17 @@ __global__ void reduce_moe_slots_bf16_kernel(
 
 template <int HiddenSize, int IntermediateSize, int TopK, int BlockM, int BlockN, bool SourceRowsAreSlots>
 struct Mxfp4Int8MoeGemm {
-  using Kernel = typename Mxfp4Int8MoeKernelSelector<BlockM, BlockN, SourceRowsAreSlots>::Kernel;
+  using BaseKernel = typename Mxfp4Int8MoeKernelSelector<BlockM, BlockN, SourceRowsAreSlots>::Kernel;
   static constexpr int kN = SourceRowsAreSlots ? HiddenSize : (IntermediateSize * 2);
   static constexpr int kK = SourceRowsAreSlots ? IntermediateSize : HiddenSize;
+  using Kernel = Mxfp4PackedBGroupedGemmKernel<
+      typename BaseKernel::Mma,
+      typename BaseKernel::Epilogue,
+      SourceRowsAreSlots,
+      kK,
+      kN>;
+  static constexpr int kBlockM = Kernel::Mma::Shape::kM;
+  static constexpr int kBlockN = Kernel::Mma::Shape::kN;
 
   static void init() {
     set_max_dynamic_smem_if_needed<Kernel>();
@@ -198,10 +206,10 @@ struct Mxfp4Int8MoeGemm {
 
     const int64_t num_align_experts = E.unwrap() + 1;
     const int64_t max_m = (num_valid_tokens < num_align_experts)
-        ? num_valid_tokens * BlockM
-        : num_valid_tokens + num_align_experts * (BlockM - 1);
-    const int grid_m_tiles = static_cast<int>(div_ceil(max_m, static_cast<int64_t>(BlockM)));
-    const int grid_n_tiles = static_cast<int>(div_ceil(static_cast<int64_t>(kN), static_cast<int64_t>(BlockN)));
+        ? num_valid_tokens * kBlockM
+        : num_valid_tokens + num_align_experts * (kBlockM - 1);
+    const int grid_m_tiles = static_cast<int>(div_ceil(max_m, static_cast<int64_t>(kBlockM)));
+    const int grid_n_tiles = static_cast<int>(div_ceil(static_cast<int64_t>(kN), static_cast<int64_t>(kBlockN)));
     RuntimeCheck(
         NumSorted.unwrap() >= max_m,
         "sorted_token_ids capacity is smaller than maximum aligned token count");
@@ -213,9 +221,8 @@ struct Mxfp4Int8MoeGemm {
     const cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
 
     const bool persistent =
-        BlockM >= 128 &&
-        BlockN >= 128 &&
-        max_m >= 65536 &&
+        kBlockM >= 128 &&
+        kBlockN >= 64 &&
         grid_m_tiles * grid_n_tiles > multi_processor_count * 2;
 
     cutlass::gemm::GemmCoord problem_size(
@@ -247,7 +254,7 @@ struct Mxfp4Int8MoeGemm {
             static_cast<const int32_t*>(sorted_token_ids.data_ptr()),
             static_cast<const int32_t*>(expert_ids.data_ptr()),
             static_cast<int>(num_valid_tokens),
-            BlockM,
+            kBlockM,
             TopK,
             kN),
         {reinterpret_cast<__nv_bfloat16*>(routed_out.data_ptr()), cutlass::layout::RowMajor(kN)},

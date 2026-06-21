@@ -371,11 +371,18 @@ struct Mxfp4GroupedScaledBf16EpilogueForMma {
       kFragmentsPerIteration>;
 };
 
-template <typename Mma_, typename Epilogue_, bool SourceRowsAreSlots_>
+template <
+    typename Mma_,
+    typename Epilogue_,
+    bool SourceRowsAreSlots_,
+    int ProblemK_ = 0,
+    int ProblemN_ = 0>
 struct Mxfp4PackedBGroupedGemmKernel {
   using Mma = Mma_;
   using Epilogue = Epilogue_;
   static bool const kSourceRowsAreSlots = SourceRowsAreSlots_;
+  static int const kProblemK = ProblemK_;
+  static int const kProblemN = ProblemN_;
   using OutputOp = typename Epilogue::OutputOp;
   using WarpCount = typename Mma::WarpCount;
   static int const kThreadCount = 32 * WarpCount::kCount;
@@ -471,6 +478,87 @@ struct Mxfp4PackedBGroupedGemmKernel {
     typename Epilogue::SharedStorage epilogue;
   };
 
+  struct ProblemShape {
+    int m;
+    int n;
+    int k;
+    int padded_m;
+
+    CUTLASS_DEVICE
+    bool contains_tile(int m_offset, int n_offset) const {
+      return m_offset < m && m_offset < padded_m && n_offset < n;
+    }
+
+    CUTLASS_DEVICE
+    int m_tiles() const {
+      return (padded_m + Mma::Shape::kM - 1) / Mma::Shape::kM;
+    }
+
+    CUTLASS_DEVICE
+    int k_iterations() const {
+      return (k + Mma::Shape::kK - 1) / Mma::Shape::kK;
+    }
+
+    CUTLASS_DEVICE
+    int packed_n_groups8() const {
+      return (n + 7) / 8;
+    }
+
+    CUTLASS_DEVICE
+    cutlass::MatrixCoord mn() const {
+      return {m, n};
+    }
+  };
+
+  CUTLASS_DEVICE
+  ProblemShape problem_shape(Params const& params) const {
+    ProblemShape shape{
+        params.problem_size.m(),
+        params.problem_size.n(),
+        params.problem_size.k(),
+        params.num_tokens_post_padded ?
+            params.num_tokens_post_padded[0] : params.problem_size.m()};
+    if constexpr (kProblemN > 0) {
+      shape.n = kProblemN;
+    }
+    if constexpr (kProblemK > 0) {
+      shape.k = kProblemK;
+    }
+    return shape;
+  }
+
+  template <bool FullNTile>
+  CUTLASS_DEVICE
+  void run_mma(
+      Params const& params,
+      Mma& mma,
+      typename Mma::FragmentC& accumulators,
+      ProblemShape const& shape,
+      uint8_t const* b_packed,
+      uint8_t const* b_shift,
+      int threadblock_m_offset,
+      int threadblock_n_offset) const {
+    mma.template operator()<FullNTile, kSourceRowsAreSlots>(
+        shape.k_iterations(),
+        accumulators,
+        params.ptr_A,
+        params.lda,
+        params.sorted_token_ids,
+        params.total_valid_slots,
+        params.top_k,
+        b_packed,
+        shape.packed_n_groups8(),
+        b_shift,
+        params.b_shift_ld,
+        threadblock_m_offset,
+        0,
+        threadblock_n_offset,
+        shape.m,
+        shape.k,
+        shape.n,
+        accumulators);
+  }
+
   CUTLASS_DEVICE
   void run_tile(
       Params const& params,
@@ -479,17 +567,12 @@ struct Mxfp4PackedBGroupedGemmKernel {
       int n_tile) {
     int threadblock_m_offset = m_tile * Mma::Shape::kM;
     int threadblock_n_offset = n_tile * Mma::Shape::kN;
-    int actual_padded_rows = params.num_tokens_post_padded ?
-        params.num_tokens_post_padded[0] : params.problem_size.m();
-    if (threadblock_m_offset >= params.problem_size.m() ||
-        threadblock_m_offset >= actual_padded_rows ||
-        threadblock_n_offset >= params.problem_size.n()) {
+    ProblemShape shape = problem_shape(params);
+    if (!shape.contains_tile(threadblock_m_offset, threadblock_n_offset)) {
       return;
     }
     int expert = params.expert_ids[m_tile];
 
-    int gemm_k_iterations =
-        (params.problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
     int thread_idx = threadIdx.x;
     int warp_idx = cutlass::canonical_warp_idx_sync();
     int lane_idx = threadIdx.x % 32;
@@ -503,46 +586,26 @@ struct Mxfp4PackedBGroupedGemmKernel {
     uint8_t const* b_shift =
         params.ptr_B_shift2 + static_cast<int64_t>(expert) * params.b_shift_expert_stride;
 
-    if ((params.problem_size.n() % Mma::Shape::kN) == 0) {
-      mma.template operator()<true, kSourceRowsAreSlots>(
-          gemm_k_iterations,
+    if ((shape.n % Mma::Shape::kN) == 0) {
+      run_mma<true>(
+          params,
+          mma,
           accumulators,
-          params.ptr_A,
-          params.lda,
-          params.sorted_token_ids,
-          params.total_valid_slots,
-          params.top_k,
+          shape,
           b_packed,
-          (params.problem_size.n() + 7) / 8,
           b_shift,
-          params.b_shift_ld,
           threadblock_m_offset,
-          0,
-          threadblock_n_offset,
-          params.problem_size.m(),
-          params.problem_size.k(),
-          params.problem_size.n(),
-          accumulators);
+          threadblock_n_offset);
     } else {
-      mma.template operator()<false, kSourceRowsAreSlots>(
-          gemm_k_iterations,
+      run_mma<false>(
+          params,
+          mma,
           accumulators,
-          params.ptr_A,
-          params.lda,
-          params.sorted_token_ids,
-          params.total_valid_slots,
-          params.top_k,
+          shape,
           b_packed,
-          (params.problem_size.n() + 7) / 8,
           b_shift,
-          params.b_shift_ld,
           threadblock_m_offset,
-          0,
-          threadblock_n_offset,
-          params.problem_size.m(),
-          params.problem_size.k(),
-          params.problem_size.n(),
-          accumulators);
+          threadblock_n_offset);
     }
 
     OutputOp output_op(params.output_op);
@@ -550,13 +613,13 @@ struct Mxfp4PackedBGroupedGemmKernel {
     typename Epilogue::OutputTileIterator iterator_C(
         params.params_C,
         params.ref_C.data(),
-        params.problem_size.mn(),
+        shape.mn(),
         thread_idx,
         threadblock_offset);
     typename Epilogue::OutputTileIterator iterator_D(
         params.params_D,
         params.ref_D.data(),
-        params.problem_size.mn(),
+        shape.mn(),
         thread_idx,
         threadblock_offset);
 
@@ -567,10 +630,15 @@ struct Mxfp4PackedBGroupedGemmKernel {
   CUTLASS_DEVICE
   void operator()(Params const& params, SharedStorage& shared_storage) {
     if (params.persistent) {
-      int total_tiles = params.grid_m_tiles * params.grid_n_tiles;
-      for (int tile = blockIdx.x; tile < total_tiles; tile += gridDim.x) {
-        int m_tile = tile / params.grid_n_tiles;
-        int n_tile = tile - m_tile * params.grid_n_tiles;
+      int actual_m_tiles = problem_shape(params).m_tiles();
+      actual_m_tiles =
+          actual_m_tiles < params.grid_m_tiles ? actual_m_tiles : params.grid_m_tiles;
+      int n_tile = blockIdx.x % params.grid_n_tiles;
+      int stripe_worker = blockIdx.x / params.grid_n_tiles;
+      int stripe_workers = (gridDim.x + params.grid_n_tiles - 1) / params.grid_n_tiles;
+      for (int m_tile = stripe_worker;
+           m_tile < actual_m_tiles;
+           m_tile += stripe_workers) {
         run_tile(params, shared_storage, m_tile, n_tile);
       }
     } else {
