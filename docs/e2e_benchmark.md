@@ -5,6 +5,8 @@ DeepSeek V4 Flash MXFP4/BF16 path. These numbers include prefill, decode,
 sparse attention/indexer work, scheduling, request streaming, CUDA graph
 warmup, and memory-system effects.
 
+MTP speculative decoding results are tracked separately in `docs/mtp.md`.
+
 ## Setup
 
 - Model: `/ssd1/models/DeepSeek-V4-Flash-MoE-MXFP4-BF16`

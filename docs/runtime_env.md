@@ -13,6 +13,19 @@ PORT=30002 \
 bash scripts/launch_dsv4_flash_mxfp4_sglang.sh
 ```
 
+Enable DeepSeek V4 MTP speculative decoding with:
+
+```bash
+SGLANG_ROOT=/path/to/sglang \
+MODEL_PATH=/path/to/DeepSeek-V4-Flash-MoE-MXFP4-BF16 \
+ENABLE_MTP=1 \
+CUDA_GRAPH_MAX_BS=8 \
+PORT=30002 \
+bash scripts/launch_dsv4_flash_mxfp4_sglang.sh
+```
+
+See `docs/mtp.md` for MTP support details and benchmark results.
+
 ## INT4 Launch
 
 ```bash

@@ -170,6 +170,7 @@ def apply_patch() -> None:
     if _PATCH_APPLIED:
         return
     _PATCH_APPLIED = True
+    _patch_deepseek_v4_nextn_mtp_init()
     _patch_deepseek_v4_hook()
     _patch_dsv4_pool_configurator()
     _patch_deepseek_v4_bf16_kv_pool()
@@ -179,6 +180,42 @@ def apply_patch() -> None:
     _patch_dsv4_mxfp4_moe_a100()
     _patch_deepseek_v4_backend()
     logger.warning("ENABLE_SGLANG_DSV4_A100_PATCH=1: monkey patch applied")
+
+
+def _patch_deepseek_v4_nextn_mtp_init() -> None:
+    try:
+        from sglang.srt.models.deepseek_v4_nextn import DeepseekV4ForCausalLMNextN
+        from sglang.srt.configs.model_config import is_deepseek_v4
+    except Exception:
+        return
+
+    if getattr(DeepseekV4ForCausalLMNextN.__init__, "_dsv4_a100_mtp_compat", False):
+        return
+
+    original_init = DeepseekV4ForCausalLMNextN.__init__
+
+    def __init__(self, *args, draft_model_idx=None, **kwargs):
+        quant_config = kwargs.get("quant_config")
+        if quant_config is None and len(args) >= 2:
+            quant_config = args[1]
+        config = kwargs.get("config")
+        if config is None and args:
+            config = args[0]
+        if is_deepseek_v4(config) and getattr(quant_config, "get_name", lambda: None)() == "fp8":
+            quant_config.is_fp4_experts = True
+            ignored_layers = list(getattr(quant_config, "ignored_layers", []) or [])
+            for layer_name in ("e_proj", "model.e_proj", "h_proj", "model.h_proj"):
+                if layer_name not in ignored_layers:
+                    ignored_layers.append(layer_name)
+            quant_config.ignored_layers = ignored_layers
+            logger.warning(
+                "Monkey patch: routing DeepSeek V4 MTP MXFP4 experts through "
+                "Mxfp4MarlinMoEMethod for mxfp4_int8 replacement."
+            )
+        original_init(self, *args, **kwargs)
+
+    __init__._dsv4_a100_mtp_compat = True
+    DeepseekV4ForCausalLMNextN.__init__ = __init__
 
 
 def _patch_deepseek_v4_hook() -> None:

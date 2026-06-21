@@ -74,6 +74,44 @@ def test_patch_deepseek_v4_defaults_sets_marlin():
     assert args.moe_runner_backend == "marlin"
 
 
+def test_patch_nextn_mtp_marks_fp4_experts():
+    import sglang.srt.models.deepseek_v4_nextn as nextn
+
+    original_init = nextn.DeepseekV4ForCausalLMNextN.__init__
+
+    def fake_init(self, config, quant_config=None, prefix=""):
+        self.config = config
+        self.quant_config = quant_config
+        self.prefix = prefix
+
+    nextn.DeepseekV4ForCausalLMNextN.__init__ = fake_init
+    try:
+        import dsv4_a100_patch.patch as patch_module
+
+        patch_module._patch_deepseek_v4_nextn_mtp_init()
+
+        class Config:
+            architectures = ["DeepseekV4ForCausalLMNextN"]
+
+        class QuantConfig:
+            is_fp4_experts = False
+            ignored_layers = []
+
+            def get_name(self):
+                return "fp8"
+
+        obj = object.__new__(nextn.DeepseekV4ForCausalLMNextN)
+        quant_config = QuantConfig()
+        nextn.DeepseekV4ForCausalLMNextN.__init__(
+            obj, Config(), quant_config, draft_model_idx=0
+        )
+        assert quant_config.is_fp4_experts is True
+        assert "model.e_proj" in quant_config.ignored_layers
+        assert "model.h_proj" in quant_config.ignored_layers
+    finally:
+        nextn.DeepseekV4ForCausalLMNextN.__init__ = original_init
+
+
 def test_bf16_gather_cpu_or_cuda():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     buf = torch.arange(2 * 4 * 1 * 8, device=device, dtype=torch.float32).to(torch.bfloat16)
