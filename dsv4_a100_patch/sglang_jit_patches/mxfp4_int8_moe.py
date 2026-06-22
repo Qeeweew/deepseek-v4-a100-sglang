@@ -97,6 +97,10 @@ def _jit_mxfp4_int8_moe_module(
                 "init_mxfp4_int8_moe_attrs",
                 f"Mxfp4Int8MoeGemm<{cpp_args}>::init",
             ),
+            (
+                "mxfp4_int8_moe_reduce",
+                f"Mxfp4Int8MoeGemm<{cpp_args}>::run_reduce",
+            ),
         ],
         extra_cuda_cflags=_mxfp4_int8_moe_cuda_flags(),
         extra_dependencies=["cutlass"],
@@ -185,4 +189,37 @@ def mxfp4_int8_moe_gemm(
         num_tokens_post_padded,
         num_valid_tokens,
         _cuda_sm_count(a_q.device.index if a_q.device.index is not None else torch.cuda.current_device()),
+    )
+
+
+@debug_kernel_api
+def mxfp4_int8_moe_reduce(
+    routed_out: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    topk: int,
+    block_m: int,
+    num_valid_tokens: int,
+    block_n: int | None = None,
+) -> None:
+    resolved_block_n = _default_block_n(block_m) if block_n is None else block_n
+    _validate_template_args(
+        hidden_size, intermediate_size, topk, block_m, resolved_block_n
+    )
+    module = _jit_mxfp4_int8_moe_module(
+        hidden_size,
+        intermediate_size,
+        topk,
+        block_m,
+        resolved_block_n,
+        True,
+    )
+    module.mxfp4_int8_moe_reduce(
+        routed_out,
+        topk_weights,
+        out,
+        num_valid_tokens,
     )

@@ -212,7 +212,10 @@ def _mxfp4_int8_moe_grouped_gemm_nt(
     global _MXFP4_INT8_MOE_JIT_AVAILABLE
     if _mxfp4_int8_moe_jit_enabled() and _MXFP4_INT8_MOE_JIT_AVAILABLE is not False:
         try:
-            from dsv4_a100_patch.sglang_jit_patches.mxfp4_int8_moe import mxfp4_int8_moe_gemm
+            from dsv4_a100_patch.sglang_jit_patches.mxfp4_int8_moe import (
+                mxfp4_int8_moe_gemm,
+                mxfp4_int8_moe_reduce,
+            )
 
             routed_out = None
             if mul_topk_weights:
@@ -241,6 +244,18 @@ def _mxfp4_int8_moe_grouped_gemm_nt(
                 num_valid_tokens=num_valid_tokens,
                 routed_out=routed_out,
             )
+            if mul_topk_weights:
+                mxfp4_int8_moe_reduce(
+                    routed_out,
+                    topk_weights,
+                    out,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    topk=topk,
+                    block_m=block_size_m,
+                    block_n=block_size_n,
+                    num_valid_tokens=num_valid_tokens,
+                )
             _MXFP4_INT8_MOE_JIT_AVAILABLE = True
             return
         except Exception:

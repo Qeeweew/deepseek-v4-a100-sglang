@@ -17,7 +17,8 @@ namespace {
 
 using namespace mxfp4_int8::cutlass_core;
 
-constexpr int kMxfp4Int8MoeReduceBlock = 256;
+constexpr int kMxfp4Int8MoeReduceWarpsPerBlock = 8;
+constexpr int kMxfp4Int8MoeReduceVec = 16;
 
 template <int BlockM, int BlockN, bool SourceRowsAreSlots>
 struct Mxfp4Int8MoeKernelSelector;
@@ -62,71 +63,66 @@ void set_max_dynamic_smem_if_needed() {
   }
 }
 
+union Mxfp4Int8MoeBf16Pack16 {
+  uint4 v;
+  __nv_bfloat16 u16[8];
+};
+
 template <int TopK>
-__global__ void reduce_moe_slots_bf16_x2_kernel(
+__global__ void reduce_moe_slots_bf16_vec_kernel(
     const __nv_bfloat16* __restrict__ slots,
     const float* __restrict__ topk_weights,
     __nv_bfloat16* __restrict__ out,
     int M,
     int N,
     int total_valid_slots) {
-  int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int n_pairs = N >> 1;
-  int total_pairs = M * n_pairs;
-  if (pair_idx >= total_pairs) {
+  int warp_id = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int token = blockIdx.y * kMxfp4Int8MoeReduceWarpsPerBlock + warp_id;
+  if (token >= M) {
     return;
   }
 
-  int token = pair_idx / n_pairs;
-  int n = (pair_idx - token * n_pairs) << 1;
+  int n_chunks = N / kMxfp4Int8MoeReduceVec;
   int slot_base = token * TopK;
-  float2 acc{0.0f, 0.0f};
 
-  CUTLASS_PRAGMA_UNROLL
-  for (int k = 0; k < TopK; ++k) {
-    int slot = slot_base + k;
-    if (slot < total_valid_slots) {
-      __nv_bfloat162 packed =
-          *reinterpret_cast<const __nv_bfloat162*>(
-              slots + static_cast<int64_t>(slot) * N + n);
-      float2 value = __bfloat1622float2(packed);
-      float weight = topk_weights[slot];
-      acc.x += value.x * weight;
-      acc.y += value.y * weight;
+  for (int chunk = blockIdx.x * 32 + lane; chunk < n_chunks; chunk += gridDim.x * 32) {
+    int n = chunk * kMxfp4Int8MoeReduceVec;
+    float acc[kMxfp4Int8MoeReduceVec];
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kMxfp4Int8MoeReduceVec; ++i) {
+      acc[i] = 0.0f;
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int k = 0; k < TopK; ++k) {
+      int slot = slot_base + k;
+      if (slot < total_valid_slots) {
+        float weight = topk_weights[slot];
+        CUTLASS_PRAGMA_UNROLL
+        for (int pack_idx = 0; pack_idx < 2; ++pack_idx) {
+          Mxfp4Int8MoeBf16Pack16 pack{
+              *reinterpret_cast<const uint4*>(
+                  slots + static_cast<int64_t>(slot) * N + n + pack_idx * 8)};
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < 8; ++i) {
+            acc[pack_idx * 8 + i] += __bfloat162float(pack.u16[i]) * weight;
+          }
+        }
+      }
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int pack_idx = 0; pack_idx < 2; ++pack_idx) {
+      Mxfp4Int8MoeBf16Pack16 out_pack;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < 8; ++i) {
+        out_pack.u16[i] = __float2bfloat16_rn(acc[pack_idx * 8 + i]);
+      }
+      *reinterpret_cast<uint4*>(
+          out + static_cast<int64_t>(token) * N + n + pack_idx * 8) = out_pack.v;
     }
   }
-
-  *reinterpret_cast<__nv_bfloat162*>(out + static_cast<int64_t>(token) * N + n) =
-      __floats2bfloat162_rn(acc.x, acc.y);
-}
-
-template <int TopK>
-__global__ void reduce_moe_slots_bf16_kernel(
-    const __nv_bfloat16* __restrict__ slots,
-    const float* __restrict__ topk_weights,
-    __nv_bfloat16* __restrict__ out,
-    int M,
-    int N,
-    int total_valid_slots) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = M * N;
-  if (idx >= total) {
-    return;
-  }
-  int token = idx / N;
-  int n = idx - token * N;
-  int slot_base = token * TopK;
-  float acc = 0.0f;
-
-  CUTLASS_PRAGMA_UNROLL
-  for (int k = 0; k < TopK; ++k) {
-    int slot = slot_base + k;
-    if (slot < total_valid_slots) {
-      float value = __bfloat162float(slots[static_cast<int64_t>(slot) * N + n]);
-      acc += value * topk_weights[slot];
-    }
-  }
-  out[idx] = __float2bfloat16(acc);
 }
 
 template <int HiddenSize, int IntermediateSize, int TopK, int BlockM, int BlockN, bool SourceRowsAreSlots>
@@ -273,39 +269,55 @@ struct Mxfp4Int8MoeGemm {
     constexpr int smem_size = int(sizeof(typename Kernel::SharedStorage));
     cutlass::Kernel<Kernel><<<grid, block, smem_size, stream>>>(params);
     host::RuntimeDeviceCheck();
+  }
 
+  static void run_reduce(
+      tvm::ffi::TensorView routed_out,
+      tvm::ffi::TensorView topk_weights,
+      tvm::ffi::TensorView out,
+      int64_t num_valid_tokens) {
+    using namespace host;
+
+    RuntimeCheck(SourceRowsAreSlots, "MXFP4-int8 MoE reduce is only valid for W2");
+
+    auto device = SymbolicDevice{};
+    auto MOut = SymbolicSize{"m_out"};
+    auto NumValidSlots = SymbolicSize{"num_valid_slots"};
+    auto TopKRows = SymbolicSize{"topk_weight_rows"};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({NumValidSlots, kN}).with_dtype<bf16_t>().with_device(device).verify(routed_out);
+    TensorMatcher({TopKRows, TopK}).with_dtype<float>().with_device(device).verify(topk_weights);
+    TensorMatcher({MOut, kN}).with_dtype<bf16_t>().with_device(device).verify(out);
+    RuntimeCheck(num_valid_tokens >= 0, "num_valid_tokens must be non-negative");
+    RuntimeCheck(NumValidSlots.unwrap() >= num_valid_tokens, "routed_out does not cover valid routed slots");
+    RuntimeCheck(MOut.unwrap() * TopK >= num_valid_tokens, "out rows do not cover routed slots");
+    RuntimeCheck(TopKRows.unwrap() * TopK >= num_valid_tokens, "topk_weights does not cover routed slots");
+    RuntimeCheck(kN % kMxfp4Int8MoeReduceVec == 0, "W2 reduce requires N divisible by 16");
+
+    const DLDevice dl_device = device.unwrap();
+    const cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
+
+    int m_out = static_cast<int>(out.shape()[0]);
     if constexpr (SourceRowsAreSlots) {
-      int m_out = static_cast<int>(out.shape()[0]);
-      if constexpr ((kN & 1) == 0 && TopK <= 8) {
-        int total_pairs = (m_out * kN) >> 1;
-        int reduce_grid = static_cast<int>(div_ceil(total_pairs, kMxfp4Int8MoeReduceBlock));
-        LaunchKernel(
-            dim3(static_cast<unsigned>(reduce_grid), 1, 1),
-            dim3(kMxfp4Int8MoeReduceBlock, 1, 1),
-            stream)(
-            reduce_moe_slots_bf16_x2_kernel<TopK>,
-            reinterpret_cast<const __nv_bfloat16*>(routed_out.data_ptr()),
-            static_cast<const float*>(topk_weights.data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-            m_out,
-            kN,
-            static_cast<int>(num_valid_tokens));
-      } else {
-        int total = m_out * kN;
-        int reduce_grid = static_cast<int>(div_ceil(total, kMxfp4Int8MoeReduceBlock));
-        LaunchKernel(
-            dim3(static_cast<unsigned>(reduce_grid), 1, 1),
-            dim3(kMxfp4Int8MoeReduceBlock, 1, 1),
-            stream)(
-            reduce_moe_slots_bf16_kernel<TopK>,
-            reinterpret_cast<const __nv_bfloat16*>(routed_out.data_ptr()),
-            static_cast<const float*>(topk_weights.data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-            m_out,
-            kN,
-            static_cast<int>(num_valid_tokens));
-      }
+      int n_chunks = kN / kMxfp4Int8MoeReduceVec;
+      int grid_x = static_cast<int>(div_ceil(n_chunks, 32));
+      grid_x = std::min(grid_x, 65535);
+      int grid_y = static_cast<int>(div_ceil(m_out, kMxfp4Int8MoeReduceWarpsPerBlock));
+      grid_y = std::min(grid_y, 65535);
+      LaunchKernel(
+          dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), 1),
+          dim3(kMxfp4Int8MoeReduceWarpsPerBlock * 32, 1, 1),
+          stream)(
+          reduce_moe_slots_bf16_vec_kernel<TopK>,
+          reinterpret_cast<const __nv_bfloat16*>(routed_out.data_ptr()),
+          static_cast<const float*>(topk_weights.data_ptr()),
+          reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+          m_out,
+          kN,
+          static_cast<int>(num_valid_tokens));
     }
+    host::RuntimeDeviceCheck();
   }
 };
 

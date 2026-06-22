@@ -187,6 +187,7 @@ def test_mxfp4_int8_moe_direct_jit_matches_original_mxfp4_reference():
 
     from dsv4_a100_patch.sglang_jit_patches.mxfp4_int8_moe import (
         mxfp4_int8_moe_gemm,
+        mxfp4_int8_moe_reduce,
     )
 
     hidden_states = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.2
@@ -233,6 +234,16 @@ def test_mxfp4_int8_moe_direct_jit_matches_original_mxfp4_reference():
         source_rows_are_slots=True,
         num_valid_tokens=tokens * topk,
         routed_out=routed_workspace,
+    )
+    mxfp4_int8_moe_reduce(
+        routed_workspace,
+        topk_weights,
+        jit_out,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        topk=topk,
+        block_m=block_m,
+        num_valid_tokens=tokens * topk,
     )
     ref_out = _mxfp4_moe_reference(
         hidden_states,

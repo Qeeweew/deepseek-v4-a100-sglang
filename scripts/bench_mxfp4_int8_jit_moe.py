@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from dsv4_a100_patch.sglang_jit_patches.mxfp4_int8_moe import (
     mxfp4_int8_moe_gemm,
+    mxfp4_int8_moe_reduce,
     prewarm_mxfp4_int8_moe_jit_modules,
 )
 from dsv4_a100_patch.triton_kernels.mxfp4_int8_moe import (
@@ -255,10 +256,34 @@ def make_synthetic_ogs_weights(dims: Dsv4Dims, device: str) -> Mxfp4OgsWeights:
     return Mxfp4OgsWeights(ogs_weights=layer._dsv4_mxfp4_ogs_weights)
 
 
-def bench_cuda_ms(fn: Callable[[], object], warmup: int, iters: int) -> float:
+def bench_cuda_ms(
+    fn: Callable[[], object],
+    warmup: int,
+    iters: int,
+    *,
+    use_cuda_graph: bool,
+) -> float:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
+
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fn()
+        for _ in range(max(3, warmup // 2)):
+            graph.replay()
+        torch.cuda.synchronize()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            graph.replay()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / iters
+
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -329,6 +354,11 @@ def run_jit(
         block_n=block_n,
     )
 
+    def quant13() -> tuple[torch.Tensor, torch.Tensor]:
+        nonlocal a13_q, a13_scale
+        a13_q, a13_scale = quantize_per_token_int8(hidden, 0.0)
+        return a13_q, a13_scale
+
     def gemm13() -> torch.Tensor:
         mxfp4_int8_moe_gemm(
             a13_q,
@@ -384,9 +414,21 @@ def run_jit(
             num_valid_tokens=batch * dims.topk,
             routed_out=c2_slots,
         )
+        mxfp4_int8_moe_reduce(
+            c2_slots,
+            topk_weights,
+            c2,
+            hidden_size=dims.hidden_size,
+            intermediate_size=dims.intermediate_size,
+            topk=dims.topk,
+            block_m=block_m,
+            block_n=block_n,
+            num_valid_tokens=batch * dims.topk,
+        )
         return c2
 
     def full() -> torch.Tensor:
+        quant13()
         gemm13()
         activation()
         quant2()
@@ -395,20 +437,39 @@ def run_jit(
             c2.mul_(dims.routed_scaling_factor)
         return c2
 
-    gemm13_ms = bench_cuda_ms(gemm13, args.warmup, args.iters)
-    activation_ms = bench_cuda_ms(activation, max(3, args.warmup // 2), args.iters)
+    quant13_ms = bench_cuda_ms(
+        quant13,
+        max(3, args.warmup // 2),
+        args.iters,
+        use_cuda_graph=args.cuda_graph,
+    )
+    gemm13_ms = bench_cuda_ms(
+        gemm13, args.warmup, args.iters, use_cuda_graph=args.cuda_graph
+    )
+    activation_ms = bench_cuda_ms(
+        activation,
+        max(3, args.warmup // 2),
+        args.iters,
+        use_cuda_graph=args.cuda_graph,
+    )
     quant2()
-    gemm2_ms = bench_cuda_ms(gemm2, args.warmup, args.iters)
-    full_ms = bench_cuda_ms(full, args.warmup, args.iters)
+    gemm2_ms = bench_cuda_ms(
+        gemm2, args.warmup, args.iters, use_cuda_graph=args.cuda_graph
+    )
+    full_ms = bench_cuda_ms(
+        full, args.warmup, args.iters, use_cuda_graph=args.cuda_graph
+    )
     return {
         "backend": "mxfp4_int8_sglang_jit",
         "batch": batch,
+        "cuda_graph": int(args.cuda_graph),
         "topk": dims.topk,
         "unique_experts": int(torch.unique(topk_ids).numel()),
         "block_m": block_m,
         "block_n": block_n,
         "gemm13_ms": gemm13_ms,
         "activation_ms": activation_ms,
+        "quant13_ms": quant13_ms,
         "gemm2_ms": gemm2_ms,
         "full_ms": full_ms,
         "gemm13_tflops": tflops_for_gemm(
@@ -491,18 +552,26 @@ def run_ogs(
             output.mul_(dims.routed_scaling_factor)
         return output
 
-    gemm13_ms = bench_cuda_ms(gemm13, args.warmup, args.iters)
-    gemm2_ms = bench_cuda_ms(gemm2, args.warmup, args.iters)
-    full_ms = bench_cuda_ms(full, args.warmup, args.iters)
+    gemm13_ms = bench_cuda_ms(
+        gemm13, args.warmup, args.iters, use_cuda_graph=args.cuda_graph
+    )
+    gemm2_ms = bench_cuda_ms(
+        gemm2, args.warmup, args.iters, use_cuda_graph=args.cuda_graph
+    )
+    full_ms = bench_cuda_ms(
+        full, args.warmup, args.iters, use_cuda_graph=args.cuda_graph
+    )
     return {
         "backend": "mxfp4_ogs",
         "batch": batch,
+        "cuda_graph": int(args.cuda_graph),
         "topk": dims.topk,
         "unique_experts": int(torch.unique(topk_ids).numel()),
         "block_m": 0,
         "block_n": 0,
         "gemm13_ms": gemm13_ms,
         "activation_ms": 0.0,
+        "quant13_ms": 0.0,
         "gemm2_ms": gemm2_ms,
         "full_ms": full_ms,
         "gemm13_tflops": tflops_for_gemm(
@@ -541,6 +610,7 @@ def main() -> None:
     parser.add_argument("--global-intermediate-size", type=int, default=2048)
     parser.add_argument("--block-m", type=int, default=0)
     parser.add_argument("--block-n", type=int, default=0)
+    parser.add_argument("--cuda-graph", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--autotune-tiles",
         action="store_true",
@@ -568,7 +638,8 @@ def main() -> None:
         "dims "
         f"H={dims.hidden_size} I_global={dims.global_intermediate_size} "
         f"TP={dims.tensor_parallel_size} I_local={dims.intermediate_size} "
-        f"E={dims.num_experts} TOPK={dims.topk} device={args.device}"
+        f"E={dims.num_experts} TOPK={dims.topk} device={args.device} "
+        f"cuda_graph={args.cuda_graph}"
     )
     jit_weights = None
     ogs_weights = None
