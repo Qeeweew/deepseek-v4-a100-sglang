@@ -20,6 +20,24 @@ using namespace mxfp4_int8::cutlass_core;
 constexpr int kMxfp4Int8DenseReduceBlock = 256;
 constexpr int kMxfp4Int8DenseMaxSplitK = 4;
 
+#define MXFP4_DENSE_LAUNCH_SPLITK_PARTIAL(KernelType)                 \
+  launch_dense_mxfp4_int8_splitk_partial<KernelType>(                  \
+      a_q, b_mxfp4, b_shift2, partial, m, N, K, kAccLd, split_k_slices, stream)
+
+#define MXFP4_DENSE_LAUNCH_GEMM(KernelType)                            \
+  launch_dense_mxfp4_int8_gemm<KernelType>(                            \
+      a_q,                                                             \
+      a_scale,                                                         \
+      b_mxfp4,                                                         \
+      b_shift2,                                                        \
+      b_channel_scale,                                                 \
+      out,                                                             \
+      m,                                                               \
+      N,                                                               \
+      K,                                                               \
+      static_cast<int>(multi_processor_count),                         \
+      stream)
+
 template <typename Kernel>
 void set_dense_max_dynamic_smem_if_needed() {
   constexpr int smem_size = int(sizeof(typename Kernel::SharedStorage));
@@ -196,8 +214,7 @@ void launch_dense_mxfp4_int8_gemm(
       typename Kernel::Epilogue::OutputTileIterator::Params(
           cutlass::layout::RowMajor(n),
           static_cast<const float*>(a_scale.data_ptr()),
-          static_cast<const float*>(b_channel_scale.data_ptr()),
-          nullptr),
+          static_cast<const float*>(b_channel_scale.data_ptr())),
       {reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
        cutlass::layout::RowMajor(n)},
       {},
@@ -365,21 +382,17 @@ struct Mxfp4Int8DenseGemm {
           PartialSplit.unwrap() >= split_k_slices,
           "partial split dimension is smaller than selected split-k slices");
       if (m <= 16) {
-        launch_dense_mxfp4_int8_splitk_partial<
-            Mxfp4PackedBOnDemandCutlassKernel16N32K128>(
-            a_q, b_mxfp4, b_shift2, partial, m, N, K, kAccLd, split_k_slices, stream);
+        MXFP4_DENSE_LAUNCH_SPLITK_PARTIAL(
+            Mxfp4PackedBOnDemandCutlassKernel16N32K128);
       } else if (m <= 32) {
-        launch_dense_mxfp4_int8_splitk_partial<
-            Mxfp4PackedBOnDemandCutlassKernel32N64K128>(
-            a_q, b_mxfp4, b_shift2, partial, m, N, K, kAccLd, split_k_slices, stream);
+        MXFP4_DENSE_LAUNCH_SPLITK_PARTIAL(
+            Mxfp4PackedBOnDemandCutlassKernel32N64K128);
       } else if (m <= 64) {
-        launch_dense_mxfp4_int8_splitk_partial<
-            Mxfp4PackedBOnDemandCutlassKernel64N64K128>(
-            a_q, b_mxfp4, b_shift2, partial, m, N, K, kAccLd, split_k_slices, stream);
+        MXFP4_DENSE_LAUNCH_SPLITK_PARTIAL(
+            Mxfp4PackedBOnDemandCutlassKernel64N64K128);
       } else {
-        launch_dense_mxfp4_int8_splitk_partial<
-            Mxfp4PackedBCutlassKernel128N64K128>(
-            a_q, b_mxfp4, b_shift2, partial, m, N, K, kAccLd, split_k_slices, stream);
+        MXFP4_DENSE_LAUNCH_SPLITK_PARTIAL(
+            Mxfp4PackedBCutlassKernel128N64K128);
       }
       dispatch_reduce_splitk_scale_to_bf16(
           static_cast<const int32_t*>(partial.data_ptr()),
@@ -406,26 +419,21 @@ struct Mxfp4Int8DenseGemm {
         grid_m_tiles * grid_n_tiles > multi_processor_count * 2;
 
     if (use_persistent && use_n64_tile) {
-      launch_dense_mxfp4_int8_gemm<
-          Mxfp4PackedBScaledBf16Persistent_256x64x64_CutlassKernel>(
-          a_q, a_scale, b_mxfp4, b_shift2, b_channel_scale, out,
-          m, N, K, static_cast<int>(multi_processor_count), stream);
+      MXFP4_DENSE_LAUNCH_GEMM(
+          Mxfp4PackedBScaledBf16Persistent_256x64x64_CutlassKernel);
     } else if (use_n64_tile) {
-      launch_dense_mxfp4_int8_gemm<
-          Mxfp4PackedBScaledBf16_256x64x64_CutlassKernel>(
-          a_q, a_scale, b_mxfp4, b_shift2, b_channel_scale, out,
-          m, N, K, static_cast<int>(multi_processor_count), stream);
+      MXFP4_DENSE_LAUNCH_GEMM(
+          Mxfp4PackedBScaledBf16_256x64x64_CutlassKernel);
     } else if (use_persistent) {
-      launch_dense_mxfp4_int8_gemm<
-          Mxfp4PackedBScaledBf16PersistentCutlassKernel>(
-          a_q, a_scale, b_mxfp4, b_shift2, b_channel_scale, out,
-          m, N, K, static_cast<int>(multi_processor_count), stream);
+      MXFP4_DENSE_LAUNCH_GEMM(
+          Mxfp4PackedBScaledBf16PersistentCutlassKernel);
     } else {
-      launch_dense_mxfp4_int8_gemm<Mxfp4PackedBScaledBf16CutlassKernel>(
-          a_q, a_scale, b_mxfp4, b_shift2, b_channel_scale, out,
-          m, N, K, static_cast<int>(multi_processor_count), stream);
+      MXFP4_DENSE_LAUNCH_GEMM(Mxfp4PackedBScaledBf16CutlassKernel);
     }
   }
 };
+
+#undef MXFP4_DENSE_LAUNCH_GEMM
+#undef MXFP4_DENSE_LAUNCH_SPLITK_PARTIAL
 
 }  // namespace

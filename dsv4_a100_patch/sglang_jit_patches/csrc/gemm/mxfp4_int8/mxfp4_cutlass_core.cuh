@@ -119,11 +119,10 @@ struct IdentityInt32OutputOp {
   }
 };
 
-template <typename ThreadMap_, bool HasBias_>
+template <typename ThreadMap_>
 class ScaledBf16OutputTileIterator {
  public:
   using ThreadMap = ThreadMap_;
-  static bool const kHasBias = HasBias_;
   using Shape = typename ThreadMap::Shape;
   using Element = int32_t;
   using Layout = cutlass::layout::RowMajor;
@@ -149,7 +148,6 @@ class ScaledBf16OutputTileIterator {
 
     float const* a_scale;
     float const* b_channel_scale;
-    __nv_bfloat16 const* bias;
     int output_stride;
 
     CUTLASS_HOST_DEVICE
@@ -157,7 +155,6 @@ class ScaledBf16OutputTileIterator {
         : Base(),
           a_scale(nullptr),
           b_channel_scale(nullptr),
-          bias(nullptr),
           output_stride(0) {}
 
     CUTLASS_HOST_DEVICE
@@ -167,21 +164,18 @@ class ScaledBf16OutputTileIterator {
               cutlass::epilogue::threadblock::make_OutputTileThreadMapDesc<ThreadMap>()),
           a_scale(nullptr),
           b_channel_scale(nullptr),
-          bias(nullptr),
           output_stride(layout.stride(0)) {}
 
     CUTLASS_HOST_DEVICE
     Params(
         Layout const& layout,
         float const* a_scale_,
-        float const* b_channel_scale_,
-        __nv_bfloat16 const* bias_)
+        float const* b_channel_scale_)
         : Base(
               layout.stride(0) * int(sizeof(__nv_bfloat16)),
               cutlass::epilogue::threadblock::make_OutputTileThreadMapDesc<ThreadMap>()),
           a_scale(a_scale_),
           b_channel_scale(b_channel_scale_),
-          bias(bias_),
           output_stride(layout.stride(0)) {}
   };
 
@@ -277,7 +271,7 @@ class ScaledBf16OutputTileIterator {
     uint8_t* byte_pointer = byte_pointer_;
     AccessType const* frag_ptr = reinterpret_cast<AccessType const*>(&frag);
 
-    if constexpr (ThreadMap::kElementsPerAccess == 4 && !kHasBias) {
+    if constexpr (ThreadMap::kElementsPerAccess == 4) {
       if (no_bounds_check_) {
         CUTLASS_PRAGMA_UNROLL
         for (int cluster = 0; cluster < ThreadMap::Iterations::kCluster; ++cluster) {
@@ -377,18 +371,6 @@ class ScaledBf16OutputTileIterator {
                 float v1 = static_cast<float>(access[1]) * a * b.y;
                 float v2 = static_cast<float>(access[2]) * a * b.z;
                 float v3 = static_cast<float>(access[3]) * a * b.w;
-                if constexpr (kHasBias) {
-                  __nv_bfloat162 bias01 =
-                      *reinterpret_cast<__nv_bfloat162 const*>(params_.bias + global_n);
-                  __nv_bfloat162 bias23 =
-                      *reinterpret_cast<__nv_bfloat162 const*>(params_.bias + global_n + 2);
-                  float2 bias01_f = __bfloat1622float2(bias01);
-                  float2 bias23_f = __bfloat1622float2(bias23);
-                  v0 += bias01_f.x;
-                  v1 += bias01_f.y;
-                  v2 += bias23_f.x;
-                  v3 += bias23_f.y;
-                }
                 __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(
                     row_pointer + column_offset * int(sizeof(__nv_bfloat16)));
                 *reinterpret_cast<__nv_bfloat162*>(dst + 0) =
@@ -402,9 +384,6 @@ class ScaledBf16OutputTileIterator {
                   if (guard && n < extent_column_) {
                     float value = static_cast<float>(access[e]) *
                         a * params_.b_channel_scale[n];
-                    if constexpr (kHasBias) {
-                      value += __bfloat162float(params_.bias[n]);
-                    }
                     reinterpret_cast<__nv_bfloat16*>(
                         row_pointer + (column_offset + e) *
                             int(sizeof(__nv_bfloat16)))[0] =
@@ -419,9 +398,6 @@ class ScaledBf16OutputTileIterator {
                 if (guard && n < extent_column_) {
                   float value = static_cast<float>(access[e]) *
                       a * params_.b_channel_scale[n];
-                  if constexpr (kHasBias) {
-                    value += __bfloat162float(params_.bias[n]);
-                  }
                   reinterpret_cast<__nv_bfloat16*>(
                       row_pointer + (column_offset + e) *
                           int(sizeof(__nv_bfloat16)))[0] =
@@ -1372,7 +1348,7 @@ using Mxfp4EpilogueForMma =
         Mxfp4EpilogueOp,
         Mxfp4EpilogueOp::kCount>::Epilogue;
 
-template <typename Mma_, bool HasBias_>
+template <typename Mma_>
 struct Mxfp4ScaledBf16EpilogueForMma {
   using Mma = Mma_;
   using OutputOp = IdentityInt32OutputOp<Mxfp4EpilogueOp::kCount>;
@@ -1384,7 +1360,7 @@ struct Mxfp4ScaledBf16EpilogueForMma {
           int32_t,
           Mxfp4EpilogueOp::kCount>::Type;
   using OutputTileIterator =
-      ScaledBf16OutputTileIterator<OutputTileThreadMap, HasBias_>;
+      ScaledBf16OutputTileIterator<OutputTileThreadMap>;
   using AccumulatorFragmentIterator =
       cutlass::epilogue::warp::FragmentIteratorTensorOp<
           typename Mma::Operator::Shape,
@@ -1683,38 +1659,20 @@ using Mxfp4PackedBCutlassKernel128N64K128 = Mxfp4PackedBGemmKernel<
     Mxfp4ThreadblockSwizzle>;
 using Mxfp4PackedBScaledBf16CutlassKernel = Mxfp4PackedBGemmKernel<
     Mxfp4PackedBThreadblockMma,
-    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma, false>::Epilogue,
-    Mxfp4ThreadblockSwizzle>;
-using Mxfp4PackedBScaledBf16BiasCutlassKernel = Mxfp4PackedBGemmKernel<
-    Mxfp4PackedBThreadblockMma,
-    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma, true>::Epilogue,
+    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma>::Epilogue,
     Mxfp4ThreadblockSwizzle>;
 using Mxfp4PackedBScaledBf16PersistentCutlassKernel = Mxfp4PackedBGemmKernel<
     Mxfp4PackedBThreadblockMma,
-    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma, false>::Epilogue,
-    Mxfp4ThreadblockSwizzle,
-    true>;
-using Mxfp4PackedBScaledBf16BiasPersistentCutlassKernel = Mxfp4PackedBGemmKernel<
-    Mxfp4PackedBThreadblockMma,
-    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma, true>::Epilogue,
+    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma>::Epilogue,
     Mxfp4ThreadblockSwizzle,
     true>;
 using Mxfp4PackedBScaledBf16_256x64x64_CutlassKernel = Mxfp4PackedBGemmKernel<
     Mxfp4PackedBThreadblockMma256N64K64,
-    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma256N64K64, false>::Epilogue,
-    Mxfp4ThreadblockSwizzle>;
-using Mxfp4PackedBScaledBf16Bias_256x64x64_CutlassKernel = Mxfp4PackedBGemmKernel<
-    Mxfp4PackedBThreadblockMma256N64K64,
-    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma256N64K64, true>::Epilogue,
+    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma256N64K64>::Epilogue,
     Mxfp4ThreadblockSwizzle>;
 using Mxfp4PackedBScaledBf16Persistent_256x64x64_CutlassKernel = Mxfp4PackedBGemmKernel<
     Mxfp4PackedBThreadblockMma256N64K64,
-    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma256N64K64, false>::Epilogue,
-    Mxfp4ThreadblockSwizzle,
-    true>;
-using Mxfp4PackedBScaledBf16BiasPersistent_256x64x64_CutlassKernel = Mxfp4PackedBGemmKernel<
-    Mxfp4PackedBThreadblockMma256N64K64,
-    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma256N64K64, true>::Epilogue,
+    typename Mxfp4ScaledBf16EpilogueForMma<Mxfp4PackedBThreadblockMma256N64K64>::Epilogue,
     Mxfp4ThreadblockSwizzle,
     true>;
 
