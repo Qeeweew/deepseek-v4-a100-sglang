@@ -633,12 +633,10 @@ struct Mxfp4PackedBGroupedGemmKernel {
       int actual_m_tiles = problem_shape(params).m_tiles();
       actual_m_tiles =
           actual_m_tiles < params.grid_m_tiles ? actual_m_tiles : params.grid_m_tiles;
-      int n_tile = blockIdx.x % params.grid_n_tiles;
-      int stripe_worker = blockIdx.x / params.grid_n_tiles;
-      int stripe_workers = (gridDim.x + params.grid_n_tiles - 1) / params.grid_n_tiles;
-      for (int m_tile = stripe_worker;
-           m_tile < actual_m_tiles;
-           m_tile += stripe_workers) {
+      int total_tiles = actual_m_tiles * params.grid_n_tiles;
+      for (int tile = blockIdx.x; tile < total_tiles; tile += gridDim.x) {
+        int m_tile = tile / params.grid_n_tiles;
+        int n_tile = tile - m_tile * params.grid_n_tiles;
         run_tile(params, shared_storage, m_tile, n_tile);
       }
     } else {
